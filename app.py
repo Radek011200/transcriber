@@ -571,6 +571,9 @@ class AudioRecorderApp:
         self.recording_overlay_remaining_item = None
         self.recording_overlay_dot_item = None
         self.recording_overlay_llm_item = None
+        self.recording_overlay_title_item = None
+        self.recording_overlay_stage_item = None
+        self.processing_wave_phase = 0
         self.recording_overlay_drag_offset = (0, 0)
         self.device_id = 0 if torch.cuda.is_available() else -1
         self.device_name = self.detect_device_name()
@@ -1251,6 +1254,7 @@ class AudioRecorderApp:
             "recording": "Nagrywanie...",
             "saving": "Zapisywanie audio...",
             "transcribing": "Transkrypcja...",
+            "processing_llm": "Porządkowanie promptu LLM...",
             "loading_model": "Ładowanie modelu...",
             "error": "Błąd",
         }
@@ -1311,14 +1315,16 @@ class AudioRecorderApp:
         canvas.delete("overlay_shell")
         self.create_round_rect(canvas, 0, 0, RECORDING_OVERLAY_WIDTH, RECORDING_OVERLAY_HEIGHT, 28, fill="#111827", outline="#2f3b52", width=1, tags=("overlay_shell",))
         self.recording_overlay_dot_item = canvas.create_text(26, 28, text="●", fill="#ef4444", font=("Arial", 22, "bold"), anchor="center", tags=("overlay_shell",))
-        canvas.create_text(52, 28, text="Nagrywanie", fill="#f8fafc", font=("Arial", 16, "bold"), anchor="w", tags=("overlay_shell",))
+        self.recording_overlay_title_item = canvas.create_text(52, 28, text="Nagrywanie", fill="#f8fafc", font=("Arial", 16, "bold"), anchor="w", tags=("overlay_shell",))
         self.recording_overlay_timer_item = canvas.create_text(52, 55, text="00:00 / 02:00", fill="#cbd5e1", font=("Arial", 11), anchor="w", tags=("overlay_shell",))
         self.recording_overlay_remaining_item = canvas.create_text(RECORDING_OVERLAY_WIDTH - 96, 55, text="Pozostało: 02:00", fill="#94a3b8", font=("Arial", 11), anchor="center", tags=("overlay_shell",))
+        self.recording_overlay_stage_item = canvas.create_text(52, 90, text="", fill="#93c5fd", font=("Arial", 11, "bold"), anchor="w", tags=("overlay_shell",))
         self.create_round_rect(canvas, RECORDING_OVERLAY_WIDTH - 92, 16, RECORDING_OVERLAY_WIDTH - 20, 46, 10, fill="#dc2626", outline="", tags=("overlay_shell", "stop_button"))
         canvas.create_text(RECORDING_OVERLAY_WIDTH - 56, 31, text="Stop", fill="#ffffff", font=("Arial", 11, "bold"), tags=("overlay_shell", "stop_button"))
         self.recording_overlay_llm_item = self.create_round_rect(canvas, RECORDING_OVERLAY_WIDTH - 116, 76, RECORDING_OVERLAY_WIDTH - 20, 104, 10, fill="#2563eb", outline="", tags=("overlay_shell", "llm_toggle"))
         canvas.create_text(RECORDING_OVERLAY_WIDTH - 68, 90, text="LLM ON", fill="#ffffff", font=("Arial", 10, "bold"), tags=("overlay_shell", "llm_toggle", "llm_toggle_text"))
         self.update_recording_overlay_llm_toggle()
+        self.configure_recording_overlay_for_state(self.app_state)
 
     def create_round_rect(self, canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float, radius: float, **kwargs) -> int:
         points = [
@@ -1368,15 +1374,24 @@ class AudioRecorderApp:
     def hide_recording_overlay(self) -> None:
         if self.recording_overlay_window is not None and self.recording_overlay_window.winfo_exists():
             self.recording_overlay_window.withdraw()
+        if self.recording_overlay_canvas is not None:
+            self.recording_overlay_canvas.delete("waveform")
+        if self.waveform_update_id:
+            try:
+                self.master.after_cancel(self.waveform_update_id)
+            except Exception:
+                logging.debug("Processing wave callback was already cleared.", exc_info=True)
+            self.waveform_update_id = None
 
     def set_recording_widget_state(self, state: str) -> None:
         if not hasattr(self, "recording_widget"):
             return
-        if state == "recording":
+        if state in {"recording", "saving", "transcribing", "processing_llm"}:
             self.show_recording_overlay()
-        elif state in {"idle", "saving", "transcribing", "done", "error"}:
+            self.configure_recording_overlay_for_state(state)
+        elif state in {"idle", "done", "error"}:
             self.hide_recording_overlay()
-        if state in {"recording", "saving", "transcribing", "done"}:
+        if state in {"recording", "saving", "transcribing", "processing_llm", "done"}:
             self.show_recording_widget_frame()
         elif state == "idle":
             self.hide_recording_widget()
@@ -1389,6 +1404,7 @@ class AudioRecorderApp:
             "recording": "Nagrywanie...",
             "saving": "Zapisywanie audio...",
             "transcribing": "Transkrypcja...",
+            "processing_llm": "Porządkowanie promptu LLM...",
             "done": "Gotowe. Tekst skopiowany/wklejony.",
         }
         self.recording_status_label.configure(text=labels.get(state, state))
@@ -1398,6 +1414,82 @@ class AudioRecorderApp:
             self.recording_progress_bar.set(1)
         elif state == "transcribing":
             self.recording_progress_bar.set(1)
+        elif state == "processing_llm":
+            self.recording_progress_bar.set(1)
+
+    def configure_recording_overlay_for_state(self, state: str) -> None:
+        canvas = self.recording_overlay_canvas
+        if canvas is None:
+            return
+        title_by_state = {
+            "recording": "Nagrywanie",
+            "saving": "Przygotowanie audio",
+            "transcribing": "Mowa na tekst",
+            "processing_llm": "Porządkowanie LLM",
+        }
+        subtitle_by_state = {
+            "recording": "",
+            "saving": "Zapisywanie nagrania...",
+            "transcribing": "Przetwarzanie mowy na tekst...",
+            "processing_llm": "Tworzenie uporządkowanego promptu...",
+        }
+        accent = "#ef4444" if state == "recording" else "#38bdf8"
+        if self.recording_overlay_title_item is not None:
+            canvas.itemconfigure(self.recording_overlay_title_item, text=title_by_state.get(state, state))
+        if self.recording_overlay_stage_item is not None:
+            canvas.itemconfigure(self.recording_overlay_stage_item, text=subtitle_by_state.get(state, ""), fill="#93c5fd")
+        if self.recording_overlay_dot_item is not None:
+            canvas.itemconfigure(self.recording_overlay_dot_item, text="●", fill=accent)
+        stop_state = "normal" if state == "recording" else "hidden"
+        llm_state = "normal" if state == "recording" else "hidden"
+        canvas.itemconfigure("stop_button", state=stop_state)
+        canvas.itemconfigure("llm_toggle", state=llm_state)
+        canvas.itemconfigure("llm_toggle_text", state=llm_state)
+        if state == "recording":
+            canvas.delete("waveform")
+            self.update_recording_overlay_llm_toggle()
+        else:
+            if self.waveform_update_id:
+                try:
+                    self.master.after_cancel(self.waveform_update_id)
+                except Exception:
+                    logging.debug("Processing wave callback was already cleared.", exc_info=True)
+                self.waveform_update_id = None
+            self.draw_processing_wave(state)
+
+    def draw_processing_wave(self, state: str | None = None) -> None:
+        canvas = self.recording_overlay_canvas
+        if canvas is None or not canvas.winfo_exists():
+            return
+        if state is None:
+            state = self.app_state
+        if self.app_state not in {"saving", "transcribing", "processing_llm"} or state not in {"saving", "transcribing", "processing_llm"}:
+            canvas.delete("waveform")
+            return
+        canvas.delete("waveform")
+        left = 28
+        right = RECORDING_OVERLAY_WIDTH - 28
+        top = 112
+        bottom = 162
+        center_y = (top + bottom) / 2
+        segment_count = 36
+        gap = 3
+        segment_width = max(4, int((right - left - gap * (segment_count - 1)) / segment_count))
+        start_x = left
+        phase = self.processing_wave_phase
+        for index in range(segment_count):
+            wave = (math.sin((index + phase) / 2.2) + 1.0) / 2.0
+            pulse = (math.sin((index - phase) / 4.0) + 1.0) / 2.0
+            intensity = 0.25 + wave * 0.45 + pulse * 0.30
+            bar_height = 8 + intensity * (bottom - top - 8)
+            x1 = start_x + index * (segment_width + gap)
+            x2 = x1 + segment_width
+            y1 = center_y - bar_height / 2
+            y2 = center_y + bar_height / 2
+            color = "#60a5fa" if state != "processing_llm" else "#22c55e"
+            canvas.create_rectangle(x1, y1, x2, y2, fill=color, outline="", tags=("waveform",))
+        self.processing_wave_phase = (self.processing_wave_phase + 1) % segment_count
+        self.waveform_update_id = self.master.after(120, self.draw_processing_wave)
 
     def update_recording_overlay_llm_toggle(self) -> None:
         if self.recording_overlay_canvas is None:
@@ -2194,16 +2286,19 @@ class AudioRecorderApp:
         return result
 
     def handle_successful_transcription(self, transcription: str, metadata: dict, processed_text: str = "") -> PasteResult:
+        effective_paste_preference = self.paste_output_preference
+        if metadata.get("prompt_processing_enabled_for_recording"):
+            effective_paste_preference = "processed"
         output_text, output_used = select_paste_output(
             transcription,
             processed_text,
-            self.paste_output_preference,
+            effective_paste_preference,
             metadata.get("prompt_processing_error") or None,
             self.fallback_to_original_on_llm_error,
         )
-        metadata["paste_output_preference"] = self.paste_output_preference
+        metadata["paste_output_preference"] = effective_paste_preference
         metadata["paste_output_used"] = output_used
-        if self.paste_output_preference == "processed" and output_used == "original_no_processed_prompt":
+        if effective_paste_preference == "processed" and output_used == "original_no_processed_prompt":
             self.set_status("Prompt LLM nie został wygenerowany. Wklejam oryginał.")
         prepared_text = prepare_text_for_paste(
             output_text,
@@ -2600,7 +2695,11 @@ class AudioRecorderApp:
                 error = queue_item.get("error", "Unknown error")
                 messagebox.showerror("Model Loading Failed", f"Could not load {model_name}.\n\n{error}\n\nCheck transcriber.log for details.")
             elif item_type == "status":
-                self.set_status(queue_item.get("status", "Praca w toku..."))
+                status_text = queue_item.get("status", "Praca w toku...")
+                if "Porządkowanie" in status_text:
+                    self.app_state = "processing_llm"
+                    self.set_recording_widget_state("processing_llm")
+                self.set_status(status_text)
             elif item_type == "llm_connection_status":
                 self.apply_llm_connection_status(queue_item["status"])
             elif item_type == "transcription":
