@@ -7,6 +7,8 @@
 - Automatyczne sprawdzanie połączenia z lokalnym LLM po starcie aplikacji.
 - Ręczne sprawdzanie połączenia LLM z poziomu widoku `Modele`.
 - Widoczny stan, czy LLM będzie przetwarzał kolejne nagrania, czy jest dostępny tylko ręcznie.
+- Przycisk `Generuj prompt` w dashboardzie, który tworzy prompt z ostatniej transkrypcji nawet przy wyłączonym automatycznym LLM.
+- Ustawienie domyślnego generowania promptu LLM w ustawieniach transkrypcji.
 
 ### Zmieniono
 - Dashboard lepiej układa cztery główne karty: `Status`, `Model`, `Auto-paste`, `Model LLM`.
@@ -14,6 +16,8 @@
 - Pływający overlay pokazuje etapy przetwarzania po zatrzymaniu nagrania.
 - Podczas transkrypcji i pracy LLM ta sama główna falka zmienia tryb animacji zamiast dodawać osobny pasek.
 - Gdy LLM jest włączony dla nagrania, auto-paste wkleja wygenerowany prompt zamiast surowej transkrypcji.
+- Przełącznik `LLM ON/OFF` w overlayu zapamiętuje wybór jako domyślne zachowanie kolejnych nagrań.
+- Ręczne generowanie promptu sprawdza dostępność lokalnego LLM przed uruchomieniem przetwarzania.
 
 ## 0.3.0 - Lokalny LLM do porządkowania transkrypcji
 

@@ -2,6 +2,8 @@
 
 Azor Transcriber to nowoczesna i szybka aplikacja GUI do transkrypcji mowy na tekst w czasie rzeczywistym. Wykorzystuje potężne modele **OpenAI Whisper**, aby zamieniać Twoje słowa w tekst i automatycznie wklejać go tam, gdzie aktualnie piszesz.
 
+Zobacz też: [Changelog](CHANGELOG.md)
+
 ![Główny widok aplikacji](public/ekran-startowy.png)
 
 ## Główne cechy

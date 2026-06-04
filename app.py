@@ -818,7 +818,7 @@ class AudioRecorderApp:
             buttons.grid_columnconfigure(col, weight=1)
         ctk.CTkButton(buttons, text="Kopiuj transkrypcję", command=lambda: self.copy_last_text("original")).grid(row=0, column=0, padx=6, sticky="ew")
         ctk.CTkButton(buttons, text="Kopiuj prompt", command=lambda: self.copy_last_text("processed")).grid(row=0, column=1, padx=6, sticky="ew")
-        ctk.CTkButton(buttons, text="Przetwórz ponownie", command=self.reprocess_last_transcription).grid(row=0, column=2, padx=6, sticky="ew")
+        ctk.CTkButton(buttons, text="Generuj prompt", command=self.generate_prompt_from_last_transcription).grid(row=0, column=2, padx=6, sticky="ew")
         ctk.CTkButton(buttons, text="Wklej wybraną wersję", command=self.paste_selected_preview_text).grid(row=0, column=3, padx=6, sticky="ew")
         ctk.CTkButton(buttons, text="Wyczyść podgląd", command=self.clear_output_preview).grid(row=0, column=4, padx=6, sticky="ew")
 
@@ -1043,6 +1043,7 @@ class AudioRecorderApp:
         self.on_record_duration_preset_change(self.record_duration_preset_var.get())
 
     def build_transcription_settings_card(self, parent, row: int, column: int):
+        self.ensure_prompt_processing_vars()
         card = ctk.CTkFrame(parent)
         card.grid(row=row, column=column, padx=8, pady=8, sticky="nsew")
         card.grid_columnconfigure(1, weight=1)
@@ -1051,6 +1052,7 @@ class AudioRecorderApp:
         ctk.CTkOptionMenu(card, values=["polish", "english", "auto"], variable=self.language_var).grid(row=1, column=1, padx=14, pady=8, sticky="ew")
         ctk.CTkLabel(card, text="Num beams").grid(row=2, column=0, padx=14, pady=8, sticky="w")
         ctk.CTkOptionMenu(card, values=["1", "3", "5"], variable=self.num_beams_var).grid(row=2, column=1, padx=14, pady=8, sticky="ew")
+        ctk.CTkSwitch(card, text="Domyślnie generuj prompt LLM", variable=self.prompt_processing_default_var).grid(row=3, column=0, columnspan=2, padx=14, pady=(8, 14), sticky="w")
 
     def build_paste_settings_card(self, parent, row: int, column: int):
         card = ctk.CTkFrame(parent)
@@ -1505,8 +1507,23 @@ class AudioRecorderApp:
         if not self.recording:
             return
         self.current_record_prompt_processing_enabled = not self.current_record_prompt_processing_enabled
+        self.set_prompt_processing_default_for_recordings(self.current_record_prompt_processing_enabled, persist=True)
         self.update_recording_overlay_llm_toggle()
         self.set_status(f"LLM {'włączony' if self.current_record_prompt_processing_enabled else 'wyłączony'} dla bieżącego nagrania")
+
+    def set_prompt_processing_default_for_recordings(self, enabled: bool, persist: bool = False) -> None:
+        self.prompt_processing_default_for_recordings = bool(enabled)
+        if self.prompt_processing_default_for_recordings and not self.prompt_processing_enabled:
+            self.prompt_processing_enabled = True
+            if hasattr(self, "prompt_processing_enabled_var"):
+                self.prompt_processing_enabled_var.set(True)
+        if hasattr(self, "quick_prompt_processing_default_var"):
+            self.quick_prompt_processing_default_var.set(self.prompt_processing_default_for_recordings)
+        if hasattr(self, "prompt_processing_default_var"):
+            self.prompt_processing_default_var.set(self.prompt_processing_default_for_recordings)
+        if persist:
+            self.persist_settings()
+        self.update_status_cards()
 
     def can_process_prompt(self) -> tuple[bool, str]:
         if not self.prompt_processing_enabled:
@@ -1780,6 +1797,24 @@ class AudioRecorderApp:
         result = self.process_prompt_text(text)
         self.transcription_queue.put({"type": "prompt_reprocessed_last", "result": result})
 
+    def generate_prompt_from_last_transcription(self):
+        text = self.last_transcription_text.strip()
+        if not text:
+            self.set_status("Brak transkrypcji do wygenerowania promptu")
+            return
+        self.set_status("Sprawdzanie dostępności LLM...")
+        threading.Thread(target=self.generate_prompt_from_last_worker, args=(text,), daemon=True).start()
+
+    def generate_prompt_from_last_worker(self, text: str):
+        status = check_llm_connection(self.prompt_processor_settings())
+        self.transcription_queue.put({"type": "llm_connection_status", "status": status})
+        if not status.connected or not status.model_available:
+            self.transcription_queue.put({"type": "manual_prompt_error", "message": status.message})
+            return
+        self.transcription_queue.put({"type": "status", "status": "Porządkowanie promptu..."})
+        result = self.process_prompt_text(text)
+        self.transcription_queue.put({"type": "prompt_reprocessed_last", "result": result})
+
     def reprocess_selected_history(self):
         entry = self.selected_history_entry()
         if not entry:
@@ -1803,9 +1838,7 @@ class AudioRecorderApp:
         self.copy_to_clipboard_enabled = self.copy_to_clipboard_var.get()
         self.append_space_after_paste = self.append_space_var.get()
         if hasattr(self, "quick_prompt_processing_default_var"):
-            self.prompt_processing_default_for_recordings = self.quick_prompt_processing_default_var.get()
-        if hasattr(self, "prompt_processing_default_var"):
-            self.prompt_processing_default_var.set(self.prompt_processing_default_for_recordings)
+            self.set_prompt_processing_default_for_recordings(self.quick_prompt_processing_default_var.get())
         self.persist_settings()
         self.update_dictation_status()
 
@@ -1883,7 +1916,7 @@ class AudioRecorderApp:
     def read_prompt_processing_settings_from_ui(self):
         self.ensure_prompt_processing_vars()
         self.prompt_processing_enabled = self.prompt_processing_enabled_var.get()
-        self.prompt_processing_default_for_recordings = self.prompt_processing_default_var.get()
+        self.set_prompt_processing_default_for_recordings(self.prompt_processing_default_var.get())
         self.prompt_processing_backend = self.prompt_processing_backend_var.get()
         self.prompt_processing_model = self.prompt_processing_model_var.get()
         self.prompt_processing_ollama_url = self.prompt_processing_ollama_url_var.get().strip() or "http://localhost:11434"
@@ -1897,8 +1930,6 @@ class AudioRecorderApp:
         self.prompt_processing_max_tokens = max(64, min(8192, int(self.prompt_processing_max_tokens_var.get())))
         self.paste_output_preference = self.paste_output_preference_var.get()
         self.fallback_to_original_on_llm_error = self.fallback_to_original_on_llm_error_var.get()
-        if hasattr(self, "quick_prompt_processing_default_var"):
-            self.quick_prompt_processing_default_var.set(self.prompt_processing_default_for_recordings)
 
     def save_prompt_processing_settings_from_ui(self):
         try:
@@ -2702,6 +2733,8 @@ class AudioRecorderApp:
                 self.set_status(status_text)
             elif item_type == "llm_connection_status":
                 self.apply_llm_connection_status(queue_item["status"])
+            elif item_type == "manual_prompt_error":
+                self.set_status(f"LLM niedostępny: {queue_item.get('message', 'sprawdź konfigurację')}")
             elif item_type == "transcription":
                 self.transcribing = False
                 result = queue_item.get("text", "")
@@ -2746,6 +2779,9 @@ class AudioRecorderApp:
                 self.last_prompt_processing_error = prompt_result.error
                 self.preview_mode = "processed"
                 self.set_preview_mode("processed")
+                self.app_state = "idle"
+                self.hide_recording_overlay()
+                self.hide_recording_widget()
                 if prompt_result.error:
                     self.set_status(f"LLM error: {prompt_result.error}")
                 else:
