@@ -27,6 +27,14 @@ except ImportError:
 
 from clipboard_manager import ClipboardManager
 from paste_manager import PasteManager, PasteResult
+from prompt_processor import (
+    DEFAULT_PROMPT_PROCESSING_SYSTEM_PROMPT,
+    LLM_MODEL_OPTIONS,
+    LLM_MODEL_OPTIONS_BY_ID,
+    PromptProcessor,
+    check_llm_connection,
+    select_paste_output,
+)
 
 # --- Global Configuration ---
 APP_TITLE = "Azor Transcriber"
@@ -41,6 +49,7 @@ DEFAULT_NUM_BEAMS = 5
 DEFAULT_GLOBAL_HOTKEY = "<ctrl>+<alt>+n"
 DEFAULT_PASTE_DELAY_MS = 300
 DEFAULT_MAX_RECORD_DURATION = 120
+DEFAULT_PROMPT_PROCESSING_MODEL = "qwen3:1.7b"
 MAX_RECORD_DURATION_SECONDS = 1800
 LONG_FORM_TRANSCRIPTION_THRESHOLD_SECONDS = 30
 RECORD_DURATION_PRESETS = [30, 60, 120, 180, 300, 600, 900, 1800]
@@ -273,6 +282,17 @@ def load_settings() -> dict:
         "show_wayland_warning": True,
         "appearance_mode": "dark",
         "ui_scaling": "100%",
+        "prompt_processing_enabled": True,
+        "prompt_processing_default_for_recordings": False,
+        "prompt_processing_backend": "ollama",
+        "prompt_processing_model": DEFAULT_PROMPT_PROCESSING_MODEL,
+        "prompt_processing_ollama_url": "http://localhost:11434",
+        "prompt_processing_gguf_path": "",
+        "prompt_processing_system_prompt": DEFAULT_PROMPT_PROCESSING_SYSTEM_PROMPT,
+        "prompt_processing_temperature": 0.2,
+        "prompt_processing_max_tokens": 1024,
+        "paste_output_preference": "original",
+        "fallback_to_original_on_llm_error": True,
     }
     try:
         with open(settings_filename(), 'r', encoding='utf-8') as settings_file:
@@ -292,6 +312,13 @@ def load_settings() -> dict:
     if merged_settings["selected_model"] not in MODEL_OPTIONS_BY_ID:
         logging.warning(f"Unknown configured model: {merged_settings['selected_model']}. Using default.")
         merged_settings["selected_model"] = DEFAULT_MODEL_NAME
+    if merged_settings["prompt_processing_model"] not in LLM_MODEL_OPTIONS_BY_ID:
+        logging.warning(f"Unknown configured LLM model: {merged_settings['prompt_processing_model']}. Using default.")
+        merged_settings["prompt_processing_model"] = DEFAULT_PROMPT_PROCESSING_MODEL
+    if merged_settings["prompt_processing_backend"] not in {"ollama", "llama-cpp-python"}:
+        merged_settings["prompt_processing_backend"] = "ollama"
+    if merged_settings["paste_output_preference"] not in {"original", "processed"}:
+        merged_settings["paste_output_preference"] = "original"
     return merged_settings
 
 def save_settings(settings: dict):
@@ -440,8 +467,8 @@ class AudioRecorderApp:
     def __init__(self, master):
         self.master = master
         self.master.title(APP_TITLE)
-        self.master.geometry("980x640")
-        self.master.minsize(900, 580)
+        self.master.geometry("1180x640")
+        self.master.minsize(1100, 580)
         self.master.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         logging.info("CustomTkinter GUI initialization started.")
@@ -494,6 +521,17 @@ class AudioRecorderApp:
         self.restore_previous_window_before_paste = bool(self.settings["restore_previous_window_before_paste"])
         self.paste_method_preference = str(self.settings["paste_method_preference"])
         self.show_wayland_warning = bool(self.settings["show_wayland_warning"])
+        self.prompt_processing_enabled = bool(self.settings["prompt_processing_enabled"])
+        self.prompt_processing_default_for_recordings = bool(self.settings["prompt_processing_default_for_recordings"])
+        self.prompt_processing_backend = str(self.settings["prompt_processing_backend"])
+        self.prompt_processing_model = str(self.settings["prompt_processing_model"])
+        self.prompt_processing_ollama_url = str(self.settings["prompt_processing_ollama_url"])
+        self.prompt_processing_gguf_path = str(self.settings["prompt_processing_gguf_path"])
+        self.prompt_processing_system_prompt = str(self.settings["prompt_processing_system_prompt"])
+        self.prompt_processing_temperature = float(self.settings["prompt_processing_temperature"])
+        self.prompt_processing_max_tokens = int(self.settings["prompt_processing_max_tokens"])
+        self.paste_output_preference = str(self.settings["paste_output_preference"])
+        self.fallback_to_original_on_llm_error = bool(self.settings["fallback_to_original_on_llm_error"])
 
         self.asr_pipeline = None
         self.current_model_name = None
@@ -501,6 +539,14 @@ class AudioRecorderApp:
         self.transcribing = False
         self.app_state = "idle"
         self.last_transcription_text = ""
+        self.last_processed_text = ""
+        self.last_prompt_processing_error = None
+        self.preview_mode = "original"
+        self.history_view_mode = "original"
+        self.current_record_prompt_processing_enabled = self.prompt_processing_default_for_recordings
+        self.llm_connection_check_running = False
+        self.llm_connection_status = None
+        self.llm_connection_summary = "Nie sprawdzono"
         self.last_paste_result = None
         self.recording_timer_ui_id = None
         self.waveform_update_id = None
@@ -524,6 +570,7 @@ class AudioRecorderApp:
         self.recording_overlay_timer_item = None
         self.recording_overlay_remaining_item = None
         self.recording_overlay_dot_item = None
+        self.recording_overlay_llm_item = None
         self.recording_overlay_drag_offset = (0, 0)
         self.device_id = 0 if torch.cuda.is_available() else -1
         self.device_name = self.detect_device_name()
@@ -553,6 +600,7 @@ class AudioRecorderApp:
         self.set_app_state("idle")
 
         self.master.after(100, self.check_transcription_queue)
+        self.master.after(500, self.check_llm_connection_async)
         self.load_model_async(self.selected_model_name)
         self.start_hotkey_listener()
         self.update_floating_window()
@@ -732,11 +780,13 @@ class AudioRecorderApp:
         card = ctk.CTkFrame(parent, corner_radius=10)
         card.grid(row=row, column=column, padx=6, pady=6, sticky="nsew")
         card.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(card, text=title, text_color="gray75", anchor="w").grid(row=0, column=0, padx=14, pady=(12, 2), sticky="ew")
-        value_label = ctk.CTkLabel(card, text=value, font=ctk.CTkFont(size=18, weight="bold"), anchor="w")
+        title_label = ctk.CTkLabel(card, text=title, text_color="gray75", anchor="w", justify="left")
+        title_label.grid(row=0, column=0, padx=14, pady=(12, 2), sticky="ew")
+        value_label = ctk.CTkLabel(card, text=value, font=ctk.CTkFont(size=17, weight="bold"), anchor="w", justify="left")
         value_label.grid(row=1, column=0, padx=14, pady=(0, 2), sticky="ew")
-        sub_label = ctk.CTkLabel(card, text="", text_color="gray70", anchor="w")
+        sub_label = ctk.CTkLabel(card, text="", text_color="gray70", anchor="w", justify="left")
         sub_label.grid(row=2, column=0, padx=14, pady=(0, 12), sticky="ew")
+        card._responsive_labels = (title_label, value_label, sub_label)
         return card, value_label, sub_label
 
     def build_dictation_view(self):
@@ -744,13 +794,15 @@ class AudioRecorderApp:
         frame.grid_rowconfigure(4, weight=1)
         ctk.CTkLabel(frame, text="Dyktowanie", font=ctk.CTkFont(size=28, weight="bold")).grid(row=0, column=0, sticky="w", pady=(0, 12))
 
-        cards = ctk.CTkFrame(frame, fg_color="transparent")
-        cards.grid(row=1, column=0, sticky="ew")
-        for col in range(3):
-            cards.grid_columnconfigure(col, weight=1)
-        _, self.status_card_value, self.status_card_subvalue = self.create_card(cards, "Status", "Gotowe", 0, 0)
-        _, self.model_card_value, self.model_card_subvalue = self.create_card(cards, "Model", "Brak", 0, 1)
-        _, self.autopaste_card_value, self.autopaste_card_subvalue = self.create_card(cards, "Auto-paste", "ON" if self.auto_paste_enabled else "OFF", 0, 2)
+        self.dashboard_cards_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        self.dashboard_cards_frame.grid(row=1, column=0, sticky="ew")
+        status_card, self.status_card_value, self.status_card_subvalue = self.create_card(self.dashboard_cards_frame, "Status", "Gotowe", 0, 0)
+        model_card, self.model_card_value, self.model_card_subvalue = self.create_card(self.dashboard_cards_frame, "Model", "Brak", 0, 1)
+        autopaste_card, self.autopaste_card_value, self.autopaste_card_subvalue = self.create_card(self.dashboard_cards_frame, "Auto-paste", "ON" if self.auto_paste_enabled else "OFF", 0, 2)
+        llm_card, self.llm_card_value, self.llm_card_subvalue = self.create_card(self.dashboard_cards_frame, "Model LLM", "OFF", 0, 3)
+        self.dashboard_cards = [status_card, model_card, autopaste_card, llm_card]
+        self.dashboard_cards_frame.bind("<Configure>", self.layout_dashboard_cards)
+        self.layout_dashboard_cards()
 
         action = ctk.CTkFrame(frame)
         action.grid(row=2, column=0, sticky="ew", pady=(10, 12))
@@ -759,11 +811,13 @@ class AudioRecorderApp:
         self.record_button.grid(row=0, column=0, padx=14, pady=(14, 10), sticky="ew")
         buttons = ctk.CTkFrame(action, fg_color="transparent")
         buttons.grid(row=1, column=0, padx=8, pady=(0, 12), sticky="ew")
-        for col in range(3):
+        for col in range(5):
             buttons.grid_columnconfigure(col, weight=1)
-        ctk.CTkButton(buttons, text="Kopiuj ostatni tekst", command=self.copy_last_text).grid(row=0, column=0, padx=6, sticky="ew")
-        ctk.CTkButton(buttons, text="Test auto-paste", command=self.test_auto_paste).grid(row=0, column=1, padx=6, sticky="ew")
-        ctk.CTkButton(buttons, text="Wyczyść podgląd", command=self.clear_output_preview).grid(row=0, column=2, padx=6, sticky="ew")
+        ctk.CTkButton(buttons, text="Kopiuj transkrypcję", command=lambda: self.copy_last_text("original")).grid(row=0, column=0, padx=6, sticky="ew")
+        ctk.CTkButton(buttons, text="Kopiuj prompt", command=lambda: self.copy_last_text("processed")).grid(row=0, column=1, padx=6, sticky="ew")
+        ctk.CTkButton(buttons, text="Przetwórz ponownie", command=self.reprocess_last_transcription).grid(row=0, column=2, padx=6, sticky="ew")
+        ctk.CTkButton(buttons, text="Wklej wybraną wersję", command=self.paste_selected_preview_text).grid(row=0, column=3, padx=6, sticky="ew")
+        ctk.CTkButton(buttons, text="Wyczyść podgląd", command=self.clear_output_preview).grid(row=0, column=4, padx=6, sticky="ew")
 
         self.recording_widget = ctk.CTkFrame(frame, corner_radius=12)
         self.recording_widget.grid(row=3, column=0, sticky="ew", pady=(0, 12))
@@ -789,21 +843,31 @@ class AudioRecorderApp:
         preview.grid(row=4, column=0, sticky="nsew")
         preview.grid_rowconfigure(1, weight=1)
         preview.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(preview, text="Ostatnia transkrypcja", font=ctk.CTkFont(size=15, weight="bold")).grid(row=0, column=0, padx=14, pady=(12, 6), sticky="w")
+        preview_header = ctk.CTkFrame(preview, fg_color="transparent")
+        preview_header.grid(row=0, column=0, padx=14, pady=(12, 6), sticky="ew")
+        preview_header.grid_columnconfigure(2, weight=1)
+        ctk.CTkLabel(preview_header, text="Ostatni wynik", font=ctk.CTkFont(size=15, weight="bold")).grid(row=0, column=0, padx=(0, 8), sticky="w")
+        self.preview_original_button = ctk.CTkButton(preview_header, text="Transkrypcja", width=120, command=lambda: self.set_preview_mode("original"))
+        self.preview_original_button.grid(row=0, column=1, padx=4, sticky="w")
+        self.preview_processed_button = ctk.CTkButton(preview_header, text="Prompt", width=90, command=lambda: self.set_preview_mode("processed"))
+        self.preview_processed_button.grid(row=0, column=2, padx=4, sticky="w")
         self.transcription_display = ctk.CTkTextbox(preview, height=220, wrap="word")
         self.transcription_display.grid(row=1, column=0, padx=14, pady=(0, 14), sticky="nsew")
         self.set_transcription_text("Tutaj pojawi się wynik transkrypcji...")
 
         quick = ctk.CTkFrame(frame)
         quick.grid(row=5, column=0, sticky="ew", pady=(12, 0))
-        for col in range(3):
+        for col in range(4):
             quick.grid_columnconfigure(col, weight=1)
         self.auto_paste_var = tk.BooleanVar(value=self.auto_paste_enabled)
         self.copy_to_clipboard_var = tk.BooleanVar(value=self.copy_to_clipboard_enabled)
         self.append_space_var = tk.BooleanVar(value=self.append_space_after_paste)
+        self.quick_prompt_processing_default_var = tk.BooleanVar(value=self.prompt_processing_default_for_recordings)
         ctk.CTkSwitch(quick, text="Auto-paste do aktywnego inputu", variable=self.auto_paste_var, command=self.on_quick_settings_change).grid(row=0, column=0, padx=14, pady=14, sticky="w")
         ctk.CTkSwitch(quick, text="Kopiuj do schowka", variable=self.copy_to_clipboard_var, command=self.on_quick_settings_change).grid(row=0, column=1, padx=14, pady=14, sticky="w")
         ctk.CTkSwitch(quick, text="Dodaj spację po tekście", variable=self.append_space_var, command=self.on_quick_settings_change).grid(row=0, column=2, padx=14, pady=14, sticky="w")
+        ctk.CTkSwitch(quick, text="Uporządkuj LLM", variable=self.quick_prompt_processing_default_var, command=self.on_quick_settings_change).grid(row=0, column=3, padx=14, pady=14, sticky="w")
+        self.update_preview_buttons()
 
     def build_history_view(self):
         frame = self.create_view("history")
@@ -816,30 +880,44 @@ class AudioRecorderApp:
         self.history_list_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
         self.history_detail_frame = ctk.CTkFrame(frame)
         self.history_detail_frame.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
-        self.history_detail_frame.grid_rowconfigure(1, weight=1)
+        self.history_detail_frame.grid_rowconfigure(2, weight=1)
         self.history_detail_frame.grid_columnconfigure(0, weight=1)
         self.history_metadata_label = ctk.CTkLabel(self.history_detail_frame, text="Wybierz wpis z historii.", justify="left", anchor="w")
         self.history_metadata_label.grid(row=0, column=0, padx=14, pady=(14, 8), sticky="ew")
+        history_tabs = ctk.CTkFrame(self.history_detail_frame, fg_color="transparent")
+        history_tabs.grid(row=1, column=0, padx=14, pady=(0, 8), sticky="ew")
+        self.history_original_button = ctk.CTkButton(history_tabs, text="Transkrypcja", width=120, command=lambda: self.set_history_view_mode("original"))
+        self.history_original_button.pack(side="left", padx=(0, 8))
+        self.history_processed_button = ctk.CTkButton(history_tabs, text="Prompt", width=90, command=lambda: self.set_history_view_mode("processed"))
+        self.history_processed_button.pack(side="left")
         self.history_display = ctk.CTkTextbox(self.history_detail_frame, wrap="word")
-        self.history_display.grid(row=1, column=0, padx=14, pady=(0, 14), sticky="nsew")
+        self.history_display.grid(row=2, column=0, padx=14, pady=(0, 14), sticky="nsew")
         self.set_textbox_text(self.history_display, "Brak transkrypcji.", disabled=True)
 
         actions = ctk.CTkFrame(frame, fg_color="transparent")
         actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
-        ctk.CTkButton(actions, text="Kopiuj zaznaczone", command=self.copy_selected_history).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(actions, text="Kopiuj transkrypcję", command=lambda: self.copy_selected_history("original")).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(actions, text="Kopiuj prompt", command=lambda: self.copy_selected_history("processed")).pack(side="left", padx=8)
+        ctk.CTkButton(actions, text="Przetwórz ponownie", command=self.reprocess_selected_history).pack(side="left", padx=8)
         ctk.CTkButton(actions, text="Usuń zaznaczone", command=self.delete_selected_history).pack(side="left", padx=8)
         ctk.CTkButton(actions, text="Wyczyść historię", command=self.clear_history).pack(side="left", padx=8)
 
     def build_models_view(self):
         frame = self.create_view("models")
         frame.grid_columnconfigure(0, weight=1)
-        frame.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(frame, text="Modele", font=ctk.CTkFont(size=28, weight="bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        frame.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(frame, text="Modele", font=ctk.CTkFont(size=28, weight="bold")).grid(row=0, column=0, sticky="w", pady=(0, 12))
 
-        selector = ctk.CTkFrame(frame)
+        content = ctk.CTkScrollableFrame(frame)
+        content.grid(row=1, column=0, sticky="nsew")
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_columnconfigure(1, weight=1)
+        self.ensure_prompt_processing_vars()
+
+        selector = ctk.CTkFrame(content)
         selector.grid(row=1, column=0, padx=(0, 8), pady=6, sticky="nsew")
         selector.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(selector, text="Wybór modelu", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, padx=14, pady=(14, 8), sticky="w")
+        ctk.CTkLabel(selector, text="Model Whisper", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, padx=14, pady=(14, 8), sticky="w")
         self.model_option_menu = ctk.CTkOptionMenu(selector, values=[model["id"] for model in MODEL_OPTIONS], command=self.on_model_selection_change)
         self.model_option_menu.grid(row=1, column=0, padx=14, pady=8, sticky="ew")
         self.model_option_menu.set(self.selected_model_name)
@@ -848,22 +926,44 @@ class AudioRecorderApp:
         self.current_model_label = ctk.CTkLabel(selector, text="Aktualnie załadowany model: brak", anchor="w", justify="left")
         self.current_model_label.grid(row=3, column=0, padx=14, pady=(8, 14), sticky="ew")
 
-        info = ctk.CTkFrame(frame)
+        info = ctk.CTkFrame(content)
         info.grid(row=1, column=1, padx=(8, 0), pady=6, sticky="nsew")
         info.grid_columnconfigure(0, weight=1)
         self.model_info_label = ctk.CTkLabel(info, text="", justify="left", anchor="w")
         self.model_info_label.grid(row=0, column=0, padx=14, pady=14, sticky="nsew")
 
-        device = ctk.CTkFrame(frame)
+        device = ctk.CTkFrame(content)
         device.grid(row=2, column=0, padx=(0, 8), pady=6, sticky="nsew")
         device.grid_columnconfigure(0, weight=1)
         self.device_label = ctk.CTkLabel(device, text="", justify="left", anchor="w")
         self.device_label.grid(row=0, column=0, padx=14, pady=14, sticky="ew")
 
-        recommendation = ctk.CTkFrame(frame)
+        recommendation = ctk.CTkFrame(content)
         recommendation.grid(row=2, column=1, padx=(8, 0), pady=6, sticky="nsew")
         recommendation_text = self.model_recommendation_text()
         ctk.CTkLabel(recommendation, text=recommendation_text, justify="left", anchor="w").grid(row=0, column=0, padx=14, pady=14, sticky="ew")
+
+        self.build_prompt_processing_settings_card(content, 3, 0, columnspan=2)
+
+        llm = ctk.CTkFrame(content)
+        llm.grid(row=4, column=0, columnspan=2, pady=(10, 0), sticky="ew")
+        llm.grid_columnconfigure(0, weight=1)
+        llm_text = "\n".join(
+            f"- {model['id']} ({model['backend']}): {model['recommendation']}"
+            for model in LLM_MODEL_OPTIONS
+        )
+        ctk.CTkLabel(llm, text="Presety modeli LLM", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, padx=14, pady=(14, 6), sticky="w")
+        ctk.CTkLabel(
+            llm,
+            text=(
+                f"Rekomendowany domyślnie: {DEFAULT_PROMPT_PROCESSING_MODEL}\n"
+                "Ollama: użyj `ollama pull <model>`. llama-cpp-python wymaga lokalnego pliku .gguf.\n"
+                "Wybór aktywnego modelu znajduje się w sekcji Lokalny LLM powyżej.\n\n"
+                f"{llm_text}"
+            ),
+            justify="left",
+            anchor="w",
+        ).grid(row=1, column=0, padx=14, pady=(0, 14), sticky="ew")
 
     def build_settings_view(self):
         frame = self.create_view("settings")
@@ -990,6 +1090,54 @@ class AudioRecorderApp:
         self.session_status_label = ctk.CTkLabel(card, text="", text_color="gray75", justify="left", anchor="w")
         self.session_status_label.grid(row=5, column=0, columnspan=2, padx=14, pady=(8, 14), sticky="ew")
 
+    def ensure_prompt_processing_vars(self):
+        if hasattr(self, "prompt_processing_model_var"):
+            return
+        self.prompt_processing_enabled_var = tk.BooleanVar(value=self.prompt_processing_enabled)
+        self.prompt_processing_default_var = tk.BooleanVar(value=self.prompt_processing_default_for_recordings)
+        self.prompt_processing_backend_var = tk.StringVar(value=self.prompt_processing_backend)
+        self.prompt_processing_model_var = tk.StringVar(value=self.prompt_processing_model)
+        self.prompt_processing_ollama_url_var = tk.StringVar(value=self.prompt_processing_ollama_url)
+        self.prompt_processing_gguf_path_var = tk.StringVar(value=self.prompt_processing_gguf_path)
+        self.prompt_processing_temperature_var = tk.StringVar(value=str(self.prompt_processing_temperature))
+        self.prompt_processing_max_tokens_var = tk.StringVar(value=str(self.prompt_processing_max_tokens))
+        self.paste_output_preference_var = tk.StringVar(value=self.paste_output_preference)
+        self.fallback_to_original_on_llm_error_var = tk.BooleanVar(value=self.fallback_to_original_on_llm_error)
+
+    def build_prompt_processing_settings_card(self, parent, row: int, column: int, columnspan: int = 1):
+        self.ensure_prompt_processing_vars()
+        card = ctk.CTkFrame(parent)
+        card.grid(row=row, column=column, columnspan=columnspan, padx=8, pady=8, sticky="nsew")
+        card.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(card, text="Lokalny LLM", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, columnspan=2, padx=14, pady=(14, 8), sticky="w")
+        ctk.CTkSwitch(card, text="Włącz funkcję", variable=self.prompt_processing_enabled_var).grid(row=1, column=0, columnspan=2, padx=14, pady=6, sticky="w")
+        ctk.CTkSwitch(card, text="Domyślnie porządkuj nagrania", variable=self.prompt_processing_default_var).grid(row=2, column=0, columnspan=2, padx=14, pady=6, sticky="w")
+        ctk.CTkLabel(card, text="Backend").grid(row=3, column=0, padx=14, pady=8, sticky="w")
+        ctk.CTkOptionMenu(card, values=["ollama", "llama-cpp-python"], variable=self.prompt_processing_backend_var).grid(row=3, column=1, padx=14, pady=8, sticky="ew")
+        ctk.CTkLabel(card, text="Model").grid(row=4, column=0, padx=14, pady=8, sticky="w")
+        ctk.CTkOptionMenu(card, values=[model["id"] for model in LLM_MODEL_OPTIONS], variable=self.prompt_processing_model_var).grid(row=4, column=1, padx=14, pady=8, sticky="ew")
+        ctk.CTkLabel(card, text="Ollama URL").grid(row=5, column=0, padx=14, pady=8, sticky="w")
+        ctk.CTkEntry(card, textvariable=self.prompt_processing_ollama_url_var).grid(row=5, column=1, padx=14, pady=8, sticky="ew")
+        ctk.CTkLabel(card, text="Ścieżka .gguf").grid(row=6, column=0, padx=14, pady=8, sticky="w")
+        ctk.CTkEntry(card, textvariable=self.prompt_processing_gguf_path_var).grid(row=6, column=1, padx=14, pady=8, sticky="ew")
+        ctk.CTkLabel(card, text="Temperatura").grid(row=7, column=0, padx=14, pady=8, sticky="w")
+        ctk.CTkEntry(card, textvariable=self.prompt_processing_temperature_var).grid(row=7, column=1, padx=14, pady=8, sticky="ew")
+        ctk.CTkLabel(card, text="Max tokenów").grid(row=8, column=0, padx=14, pady=8, sticky="w")
+        ctk.CTkEntry(card, textvariable=self.prompt_processing_max_tokens_var).grid(row=8, column=1, padx=14, pady=8, sticky="ew")
+        ctk.CTkLabel(card, text="Wklejaj").grid(row=9, column=0, padx=14, pady=8, sticky="w")
+        ctk.CTkOptionMenu(card, values=["original", "processed"], variable=self.paste_output_preference_var).grid(row=9, column=1, padx=14, pady=8, sticky="ew")
+        ctk.CTkSwitch(card, text="Fallback do oryginału przy błędzie LLM", variable=self.fallback_to_original_on_llm_error_var).grid(row=10, column=0, columnspan=2, padx=14, pady=6, sticky="w")
+        ctk.CTkLabel(card, text="Prompt systemowy").grid(row=11, column=0, padx=14, pady=8, sticky="w")
+        self.prompt_processing_system_prompt_textbox = ctk.CTkTextbox(card, height=132, wrap="word")
+        self.prompt_processing_system_prompt_textbox.grid(row=12, column=0, columnspan=2, padx=14, pady=(0, 8), sticky="ew")
+        self.prompt_processing_system_prompt_textbox.insert("end", self.prompt_processing_system_prompt)
+        llm_buttons = ctk.CTkFrame(card, fg_color="transparent")
+        llm_buttons.grid(row=13, column=0, columnspan=2, padx=8, pady=(0, 14), sticky="ew")
+        llm_buttons.grid_columnconfigure(0, weight=1)
+        llm_buttons.grid_columnconfigure(1, weight=1)
+        ctk.CTkButton(llm_buttons, text="Zapisz ustawienia LLM", height=38, command=self.save_prompt_processing_settings_from_ui).grid(row=0, column=0, padx=6, sticky="ew")
+        ctk.CTkButton(llm_buttons, text="Sprawdź połączenie LLM", height=38, command=self.check_llm_connection_from_ui).grid(row=0, column=1, padx=6, sticky="ew")
+
     def build_diagnostics_view(self):
         frame = self.create_view("diagnostics")
         frame.grid_columnconfigure(0, weight=1)
@@ -1059,6 +1207,36 @@ class AudioRecorderApp:
     def set_transcription_text(self, text: str):
         self.set_textbox_text(self.transcription_display, text, disabled=True)
 
+    def layout_dashboard_cards(self, _event=None):
+        if not hasattr(self, "dashboard_cards_frame") or not hasattr(self, "dashboard_cards"):
+            return
+        width = max(1, int(self.dashboard_cards_frame.winfo_width() or 0))
+        columns = 2 if width < 920 else 4
+        for column in range(4):
+            self.dashboard_cards_frame.grid_columnconfigure(column, weight=1 if column < columns else 0, uniform="dashboard_cards" if column < columns else "")
+        for index, card in enumerate(self.dashboard_cards):
+            card.grid(row=index // columns, column=index % columns, padx=6, pady=6, sticky="nsew")
+            card_width = max(160, int(card.winfo_width() or (width / columns)) - 28)
+            for label in getattr(card, "_responsive_labels", ()):
+                label.configure(wraplength=card_width)
+
+    def update_preview_buttons(self):
+        if not hasattr(self, "preview_original_button"):
+            return
+        self.preview_original_button.configure(fg_color=("#3B8ED0", "#1F6AA5") if self.preview_mode == "original" else "transparent")
+        self.preview_processed_button.configure(fg_color=("#3B8ED0", "#1F6AA5") if self.preview_mode == "processed" else "transparent")
+
+    def set_preview_mode(self, mode: str):
+        self.preview_mode = "processed" if mode == "processed" else "original"
+        text = self.last_processed_text if self.preview_mode == "processed" else self.last_transcription_text
+        if not text:
+            text = "Prompt LLM nie został wygenerowany." if self.preview_mode == "processed" else "Tutaj pojawi się wynik transkrypcji..."
+        self.set_transcription_text(text)
+        self.update_preview_buttons()
+
+    def current_preview_text(self) -> str:
+        return self.last_processed_text if self.preview_mode == "processed" else self.last_transcription_text
+
     def set_status(self, status: str):
         logging.info(f"Status: {status}")
         if hasattr(self, "status_label"):
@@ -1119,6 +1297,9 @@ class AudioRecorderApp:
         self.recording_overlay_canvas.tag_bind("stop_button", "<Button-1>", lambda _event: self.stop_recording())
         self.recording_overlay_canvas.tag_bind("stop_button", "<Enter>", lambda _event: self.recording_overlay_canvas.configure(cursor="hand2"))
         self.recording_overlay_canvas.tag_bind("stop_button", "<Leave>", lambda _event: self.recording_overlay_canvas.configure(cursor=""))
+        self.recording_overlay_canvas.tag_bind("llm_toggle", "<Button-1>", lambda _event: self.toggle_current_record_prompt_processing())
+        self.recording_overlay_canvas.tag_bind("llm_toggle", "<Enter>", lambda _event: self.recording_overlay_canvas.configure(cursor="hand2"))
+        self.recording_overlay_canvas.tag_bind("llm_toggle", "<Leave>", lambda _event: self.recording_overlay_canvas.configure(cursor=""))
         self.recording_overlay_window = overlay
         self.draw_recording_overlay_shell()
         self.position_recording_overlay()
@@ -1135,6 +1316,9 @@ class AudioRecorderApp:
         self.recording_overlay_remaining_item = canvas.create_text(RECORDING_OVERLAY_WIDTH - 96, 55, text="Pozostało: 02:00", fill="#94a3b8", font=("Arial", 11), anchor="center", tags=("overlay_shell",))
         self.create_round_rect(canvas, RECORDING_OVERLAY_WIDTH - 92, 16, RECORDING_OVERLAY_WIDTH - 20, 46, 10, fill="#dc2626", outline="", tags=("overlay_shell", "stop_button"))
         canvas.create_text(RECORDING_OVERLAY_WIDTH - 56, 31, text="Stop", fill="#ffffff", font=("Arial", 11, "bold"), tags=("overlay_shell", "stop_button"))
+        self.recording_overlay_llm_item = self.create_round_rect(canvas, RECORDING_OVERLAY_WIDTH - 116, 76, RECORDING_OVERLAY_WIDTH - 20, 104, 10, fill="#2563eb", outline="", tags=("overlay_shell", "llm_toggle"))
+        canvas.create_text(RECORDING_OVERLAY_WIDTH - 68, 90, text="LLM ON", fill="#ffffff", font=("Arial", 10, "bold"), tags=("overlay_shell", "llm_toggle", "llm_toggle_text"))
+        self.update_recording_overlay_llm_toggle()
 
     def create_round_rect(self, canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float, radius: float, **kwargs) -> int:
         points = [
@@ -1214,6 +1398,30 @@ class AudioRecorderApp:
             self.recording_progress_bar.set(1)
         elif state == "transcribing":
             self.recording_progress_bar.set(1)
+
+    def update_recording_overlay_llm_toggle(self) -> None:
+        if self.recording_overlay_canvas is None:
+            return
+        enabled = self.prompt_processing_enabled and self.current_record_prompt_processing_enabled
+        fill = "#16a34a" if enabled else "#475569"
+        text = "LLM ON" if enabled else "LLM OFF"
+        self.recording_overlay_canvas.itemconfigure("llm_toggle", fill=fill)
+        self.recording_overlay_canvas.itemconfigure("llm_toggle_text", text=text)
+        self.recording_overlay_canvas.itemconfigure("llm_toggle_text", fill="#ffffff")
+
+    def toggle_current_record_prompt_processing(self) -> None:
+        if not self.recording:
+            return
+        self.current_record_prompt_processing_enabled = not self.current_record_prompt_processing_enabled
+        self.update_recording_overlay_llm_toggle()
+        self.set_status(f"LLM {'włączony' if self.current_record_prompt_processing_enabled else 'wyłączony'} dla bieżącego nagrania")
+
+    def can_process_prompt(self) -> tuple[bool, str]:
+        if not self.prompt_processing_enabled:
+            return False, "Porządkowanie LLM jest wyłączone w ustawieniach."
+        if self.prompt_processing_backend == "llama-cpp-python" and not self.prompt_processing_gguf_path.strip():
+            return False, "Wskaż plik .gguf dla backendu llama-cpp-python."
+        return True, ""
 
     def update_recording_timer_ui(self) -> None:
         if not self.recording or not self.start_time:
@@ -1351,33 +1559,161 @@ class AudioRecorderApp:
         if self.last_paste_result:
             last_paste = f"{self.last_paste_result.method}: {self.last_paste_result.success}"
         self.autopaste_card_subvalue.configure(text=last_paste)
+        if hasattr(self, "llm_card_value"):
+            llm_mode = "OFF"
+            if self.prompt_processing_enabled:
+                llm_mode = "ON" if self.prompt_processing_default_for_recordings else "Ręcznie"
+            self.llm_card_value.configure(text=llm_mode)
+            self.llm_card_subvalue.configure(text=self.llm_dashboard_subvalue())
         self.status_right_label.configure(
-            text=f"Hotkey: {self.global_hotkey} | Auto-paste: {'ON' if self.auto_paste_enabled else 'OFF'} | Model: {self.short_model_name(current_model)}"
+            text=(
+                f"Hotkey: {self.global_hotkey} | Auto-paste: {'ON' if self.auto_paste_enabled else 'OFF'} | "
+                f"Model: {self.short_model_name(current_model)} | LLM: {self.short_model_name(self.prompt_processing_model)}"
+            )
         )
         self.sidebar_model_label.configure(text=f"Model: {self.short_model_name(current_model)}")
         self.sidebar_device_label.configure(text=f"Device: {self.device_name}")
         self.sidebar_session_label.configure(text=f"Session: {self.session_type}")
+
+    def llm_dashboard_subvalue(self) -> str:
+        if not self.prompt_processing_enabled:
+            return f"{self.prompt_processing_backend} | wyłączony"
+        if self.llm_connection_check_running:
+            connection = "sprawdzanie..."
+        elif self.llm_connection_status is None:
+            connection = self.llm_connection_summary
+        elif self.llm_connection_status.connected and self.llm_connection_status.model_available:
+            connection = "połączony"
+        elif self.llm_connection_status.connected:
+            connection = "backend OK, brak modelu"
+        else:
+            connection = "brak połączenia"
+        mode = "przetwarza nagrania" if self.prompt_processing_default_for_recordings else "dostępny ręcznie"
+        return f"{self.prompt_processing_backend} | {self.short_model_name(self.prompt_processing_model)}\n{connection} | {mode}"
+
+    def check_llm_connection_async(self):
+        if self.llm_connection_check_running:
+            return
+        self.llm_connection_check_running = True
+        self.llm_connection_summary = "Sprawdzanie..."
+        self.update_status_cards()
+        threading.Thread(target=self.check_llm_connection_worker, daemon=True).start()
+
+    def check_llm_connection_worker(self):
+        status = check_llm_connection(self.prompt_processor_settings())
+        self.transcription_queue.put({"type": "llm_connection_status", "status": status})
+
+    def apply_llm_connection_status(self, status):
+        self.llm_connection_check_running = False
+        self.llm_connection_status = status
+        if status.connected and status.model_available:
+            self.llm_connection_summary = "Połączony"
+        elif status.connected:
+            self.llm_connection_summary = "Backend OK, brak modelu"
+        else:
+            self.llm_connection_summary = "Brak połączenia"
+        logging.info(
+            "LLM connection status: backend=%s model=%s connected=%s model_available=%s message=%s",
+            status.backend,
+            status.model,
+            status.connected,
+            status.model_available,
+            status.message,
+        )
+        self.update_status_cards()
+        self.update_diagnostics()
 
     def short_model_name(self, model_name: str) -> str:
         return model_name.split("/")[-1] if model_name else "brak"
 
     def clear_output_preview(self):
         self.last_transcription_text = ""
+        self.last_processed_text = ""
+        self.last_prompt_processing_error = None
+        self.preview_mode = "original"
         self.set_transcription_text("Tutaj pojawi się wynik transkrypcji...")
+        self.update_preview_buttons()
         self.set_status("Gotowe")
 
-    def copy_last_text(self):
-        text = self.last_transcription_text.strip()
+    def copy_last_text(self, mode: str = "original"):
+        text = self.last_processed_text if mode == "processed" else self.last_transcription_text
+        text = text.strip()
         if not text:
-            self.set_status("Brak tekstu do skopiowania")
+            self.set_status("Brak promptu do skopiowania" if mode == "processed" else "Brak tekstu do skopiowania")
             return
         self.copy_to_clipboard(text)
+
+    def paste_selected_preview_text(self):
+        text = self.current_preview_text().strip()
+        if not text:
+            self.set_status("Brak wybranej wersji do wklejenia")
+            return
+        self.paste_text_to_active_input(prepare_text_for_paste(
+            text,
+            trim_text=self.trim_text_before_paste,
+            capitalize_first_letter=self.capitalize_first_letter,
+            append_space=self.append_space_after_paste,
+            append_newline=self.append_newline_after_paste,
+        ))
+
+    def prompt_processor_settings(self) -> dict:
+        self.settings.update({
+            "prompt_processing_backend": self.prompt_processing_backend,
+            "prompt_processing_model": self.prompt_processing_model,
+            "prompt_processing_ollama_url": self.prompt_processing_ollama_url,
+            "prompt_processing_gguf_path": self.prompt_processing_gguf_path,
+            "prompt_processing_system_prompt": self.prompt_processing_system_prompt,
+            "prompt_processing_temperature": self.prompt_processing_temperature,
+            "prompt_processing_max_tokens": self.prompt_processing_max_tokens,
+        })
+        return dict(self.settings)
+
+    def process_prompt_text(self, text: str):
+        processor = PromptProcessor(self.prompt_processor_settings())
+        return processor.process(text)
+
+    def reprocess_last_transcription(self):
+        text = self.last_transcription_text.strip()
+        if not text:
+            self.set_status("Brak transkrypcji do przetworzenia")
+            return
+        can_process, message = self.can_process_prompt()
+        if not can_process:
+            self.set_status(message)
+            return
+        self.set_status("Porządkowanie promptu...")
+        threading.Thread(target=self.reprocess_last_worker, args=(text,), daemon=True).start()
+
+    def reprocess_last_worker(self, text: str):
+        result = self.process_prompt_text(text)
+        self.transcription_queue.put({"type": "prompt_reprocessed_last", "result": result})
+
+    def reprocess_selected_history(self):
+        entry = self.selected_history_entry()
+        if not entry:
+            self.set_status("Wybierz wpis historii")
+            return
+        can_process, message = self.can_process_prompt()
+        if not can_process:
+            self.set_status(message)
+            return
+        entry_index = self.selected_history_index
+        self.set_status("Porządkowanie promptu...")
+        threading.Thread(target=self.reprocess_history_worker, args=(entry_index, entry.get("text", "")), daemon=True).start()
+
+    def reprocess_history_worker(self, entry_index: int, text: str):
+        result = self.process_prompt_text(text)
+        self.transcription_queue.put({"type": "prompt_reprocessed_history", "index": entry_index, "result": result})
 
     def on_quick_settings_change(self):
         self.auto_paste_enabled = self.auto_paste_var.get()
         self.auto_paste_after_transcription = self.auto_paste_enabled
         self.copy_to_clipboard_enabled = self.copy_to_clipboard_var.get()
         self.append_space_after_paste = self.append_space_var.get()
+        if hasattr(self, "quick_prompt_processing_default_var"):
+            self.prompt_processing_default_for_recordings = self.quick_prompt_processing_default_var.get()
+        if hasattr(self, "prompt_processing_default_var"):
+            self.prompt_processing_default_var.set(self.prompt_processing_default_for_recordings)
         self.persist_settings()
         self.update_dictation_status()
 
@@ -1438,8 +1774,60 @@ class AudioRecorderApp:
             "show_wayland_warning": self.show_wayland_warning,
             "appearance_mode": self.appearance_mode_var.get() if hasattr(self, "appearance_mode_var") else self.settings.get("appearance_mode", "dark"),
             "ui_scaling": self.ui_scaling_var.get() if hasattr(self, "ui_scaling_var") else self.settings.get("ui_scaling", "100%"),
+            "prompt_processing_enabled": self.prompt_processing_enabled,
+            "prompt_processing_default_for_recordings": self.prompt_processing_default_for_recordings,
+            "prompt_processing_backend": self.prompt_processing_backend,
+            "prompt_processing_model": self.prompt_processing_model,
+            "prompt_processing_ollama_url": self.prompt_processing_ollama_url,
+            "prompt_processing_gguf_path": self.prompt_processing_gguf_path,
+            "prompt_processing_system_prompt": self.prompt_processing_system_prompt,
+            "prompt_processing_temperature": self.prompt_processing_temperature,
+            "prompt_processing_max_tokens": self.prompt_processing_max_tokens,
+            "paste_output_preference": self.paste_output_preference,
+            "fallback_to_original_on_llm_error": self.fallback_to_original_on_llm_error,
         })
         save_settings(self.settings)
+
+    def read_prompt_processing_settings_from_ui(self):
+        self.ensure_prompt_processing_vars()
+        self.prompt_processing_enabled = self.prompt_processing_enabled_var.get()
+        self.prompt_processing_default_for_recordings = self.prompt_processing_default_var.get()
+        self.prompt_processing_backend = self.prompt_processing_backend_var.get()
+        self.prompt_processing_model = self.prompt_processing_model_var.get()
+        self.prompt_processing_ollama_url = self.prompt_processing_ollama_url_var.get().strip() or "http://localhost:11434"
+        self.prompt_processing_gguf_path = self.prompt_processing_gguf_path_var.get().strip()
+        if hasattr(self, "prompt_processing_system_prompt_textbox"):
+            system_prompt = self.prompt_processing_system_prompt_textbox.get("1.0", "end").strip()
+        else:
+            system_prompt = self.prompt_processing_system_prompt
+        self.prompt_processing_system_prompt = system_prompt or DEFAULT_PROMPT_PROCESSING_SYSTEM_PROMPT
+        self.prompt_processing_temperature = max(0.0, min(2.0, float(self.prompt_processing_temperature_var.get())))
+        self.prompt_processing_max_tokens = max(64, min(8192, int(self.prompt_processing_max_tokens_var.get())))
+        self.paste_output_preference = self.paste_output_preference_var.get()
+        self.fallback_to_original_on_llm_error = self.fallback_to_original_on_llm_error_var.get()
+        if hasattr(self, "quick_prompt_processing_default_var"):
+            self.quick_prompt_processing_default_var.set(self.prompt_processing_default_for_recordings)
+
+    def save_prompt_processing_settings_from_ui(self):
+        try:
+            self.read_prompt_processing_settings_from_ui()
+        except ValueError as e:
+            messagebox.showerror("Settings Error", f"Invalid numeric LLM setting: {e}")
+            return
+        self.persist_settings()
+        self.check_llm_connection_async()
+        self.update_diagnostics()
+        self.set_status("Ustawienia LLM zapisane")
+
+    def check_llm_connection_from_ui(self):
+        try:
+            self.read_prompt_processing_settings_from_ui()
+        except ValueError as e:
+            messagebox.showerror("Settings Error", f"Invalid numeric LLM setting: {e}")
+            return
+        self.persist_settings()
+        self.check_llm_connection_async()
+        self.set_status("Sprawdzanie połączenia LLM...")
 
     def save_settings_from_ui(self):
         try:
@@ -1475,6 +1863,7 @@ class AudioRecorderApp:
             self.restore_previous_window_before_paste = self.restore_window_var.get()
             self.paste_method_preference = self.paste_method_var.get()
             self.show_wayland_warning = self.show_wayland_warning_var.get()
+            self.read_prompt_processing_settings_from_ui()
         except ValueError as e:
             messagebox.showerror("Settings Error", f"Invalid numeric setting: {e}")
             return
@@ -1484,6 +1873,7 @@ class AudioRecorderApp:
         ctk.set_widget_scaling(scaling)
         self.paste_manager = self.create_paste_manager()
         self.persist_settings()
+        self.check_llm_connection_async()
         self.restart_hotkey_listener()
         self.update_floating_window()
         self.update_dictation_status()
@@ -1581,7 +1971,12 @@ class AudioRecorderApp:
                 f"wl-copy: {bool(shutil.which('wl-copy'))}\n"
                 f"pyautogui: {self.module_available('pyautogui')}\n"
                 f"pynput: {keyboard is not None}\n"
-                f"pyperclip: {self.module_available('pyperclip')}"
+                f"pyperclip: {self.module_available('pyperclip')}\n"
+                f"llama_cpp: {self.module_available('llama_cpp')}\n"
+                f"Ollama URL: {self.prompt_processing_ollama_url}\n"
+                f"LLM backend: {self.prompt_processing_backend}\n"
+                f"LLM model: {self.prompt_processing_model}\n"
+                f"LLM connection: {self.llm_connection_summary}"
             )
         )
 
@@ -1669,16 +2064,18 @@ class AudioRecorderApp:
         selected_index = max(0, min(selected_index, len(self.transcription_history) - 1))
         for index, entry in enumerate(self.transcription_history):
             timestamp = format_history_timestamp(entry.get("timestamp", time.time()))
-            preview = entry.get("text", "").replace("\n", " ").strip()
+            preview_source = entry.get("processed_text") or entry.get("text", "")
+            preview = preview_source.replace("\n", " ").strip()
             if len(preview) > 90:
                 preview = preview[:87] + "..."
             paste = "paste OK" if entry.get("paste_success") else "paste n/a"
+            llm = "LLM OK" if entry.get("processed_text") else ("LLM error" if entry.get("prompt_processing_error") else "LLM n/a")
             card = ctk.CTkFrame(self.history_list_frame, corner_radius=8)
             card.pack(fill="x", padx=8, pady=6)
             card.grid_columnconfigure(0, weight=1)
             ctk.CTkLabel(card, text=timestamp, text_color="gray70", anchor="w").grid(row=0, column=0, padx=10, pady=(8, 0), sticky="ew")
             ctk.CTkLabel(card, text=preview or "(puste)", anchor="w", justify="left").grid(row=1, column=0, padx=10, pady=2, sticky="ew")
-            ctk.CTkLabel(card, text=f"{entry.get('model_name', 'model n/a')} | {paste}", text_color="gray65", anchor="w").grid(row=2, column=0, padx=10, pady=(0, 8), sticky="ew")
+            ctk.CTkLabel(card, text=f"{entry.get('model_name', 'model n/a')} | {paste} | {llm}", text_color="gray65", anchor="w").grid(row=2, column=0, padx=10, pady=(0, 8), sticky="ew")
             card.bind("<Button-1>", lambda _event, i=index: self.show_history_entry(i))
             for child in card.winfo_children():
                 child.bind("<Button-1>", lambda _event, i=index: self.show_history_entry(i))
@@ -1706,10 +2103,33 @@ class AudioRecorderApp:
             f"Model: {entry.get('model_name', 'unknown')}\n"
             f"Device: {entry.get('device', 'unknown')}\n"
             f"Paste success: {entry.get('paste_success', False)}\n"
-            f"Paste method: {entry.get('paste_method', 'unknown')}"
+            f"Paste method: {entry.get('paste_method', 'unknown')}\n"
+            f"Paste output: {entry.get('paste_output_used', 'unknown')}\n"
+            f"LLM: {entry.get('prompt_processing_backend', 'n/a')} / {entry.get('prompt_processing_model', 'n/a')}\n"
+            f"LLM time: {entry.get('prompt_processing_elapsed_seconds', 'n/a')}\n"
+            f"LLM error: {entry.get('prompt_processing_error') or 'n/a'}"
         )
         self.history_metadata_label.configure(text=metadata)
-        self.set_textbox_text(self.history_display, entry.get("text", ""), disabled=True)
+        self.update_history_buttons()
+        self.set_textbox_text(self.history_display, self.history_entry_text(entry), disabled=True)
+
+    def history_entry_text(self, entry: dict) -> str:
+        if self.history_view_mode == "processed":
+            return entry.get("processed_text") or "Prompt LLM nie został wygenerowany."
+        return entry.get("text", "")
+
+    def update_history_buttons(self):
+        if not hasattr(self, "history_original_button"):
+            return
+        self.history_original_button.configure(fg_color=("#3B8ED0", "#1F6AA5") if self.history_view_mode == "original" else "transparent")
+        self.history_processed_button.configure(fg_color=("#3B8ED0", "#1F6AA5") if self.history_view_mode == "processed" else "transparent")
+
+    def set_history_view_mode(self, mode: str):
+        self.history_view_mode = "processed" if mode == "processed" else "original"
+        entry = self.selected_history_entry()
+        self.update_history_buttons()
+        if entry:
+            self.set_textbox_text(self.history_display, self.history_entry_text(entry), disabled=True)
 
     def selected_history_entry(self):
         if self.selected_history_index is None:
@@ -1718,12 +2138,16 @@ class AudioRecorderApp:
             return None
         return self.transcription_history[self.selected_history_index]
 
-    def copy_selected_history(self):
+    def copy_selected_history(self, mode: str = "original"):
         entry = self.selected_history_entry()
         if not entry:
             self.set_status("Wybierz wpis historii")
             return
-        self.copy_to_clipboard(entry.get("text", ""))
+        text = entry.get("processed_text", "") if mode == "processed" else entry.get("text", "")
+        if mode == "processed" and not text.strip():
+            self.set_status("Prompt LLM nie został wygenerowany")
+            return
+        self.copy_to_clipboard(text)
 
     def delete_selected_history(self):
         if self.selected_history_index is None:
@@ -1769,9 +2193,20 @@ class AudioRecorderApp:
         self.update_status_cards()
         return result
 
-    def handle_successful_transcription(self, transcription: str, metadata: dict) -> PasteResult:
-        prepared_text = prepare_text_for_paste(
+    def handle_successful_transcription(self, transcription: str, metadata: dict, processed_text: str = "") -> PasteResult:
+        output_text, output_used = select_paste_output(
             transcription,
+            processed_text,
+            self.paste_output_preference,
+            metadata.get("prompt_processing_error") or None,
+            self.fallback_to_original_on_llm_error,
+        )
+        metadata["paste_output_preference"] = self.paste_output_preference
+        metadata["paste_output_used"] = output_used
+        if self.paste_output_preference == "processed" and output_used == "original_no_processed_prompt":
+            self.set_status("Prompt LLM nie został wygenerowany. Wklejam oryginał.")
+        prepared_text = prepare_text_for_paste(
+            output_text,
             trim_text=self.trim_text_before_paste,
             capitalize_first_letter=self.capitalize_first_letter,
             append_space=self.append_space_after_paste,
@@ -1957,6 +2392,7 @@ class AudioRecorderApp:
             return
         self.recording = True
         self.current_trigger_source = trigger_source
+        self.current_record_prompt_processing_enabled = self.prompt_processing_enabled and self.prompt_processing_default_for_recordings
         self.target_window_id = None
         if self.dictation_mode_enabled and self.auto_paste_enabled and self.session_type == "x11":
             self.target_window_id = self.paste_manager.get_active_window_id()
@@ -1972,7 +2408,12 @@ class AudioRecorderApp:
         self.audio_level_sum = 0.0
         self.audio_level_count = 0
         self.current_record_limit_seconds = self.get_max_record_duration_seconds()
-        logging.info(f"Recording started. trigger_source={trigger_source}, target_window_id={self.target_window_id}")
+        logging.info(
+            "Recording started. trigger_source=%s, target_window_id=%s, prompt_processing=%s",
+            trigger_source,
+            self.target_window_id,
+            self.current_record_prompt_processing_enabled,
+        )
         self.set_app_state("recording")
         self.set_transcription_text("Nagrywanie w toku... (max %ss)" % self.current_record_limit_seconds)
         try:
@@ -2060,7 +2501,11 @@ class AudioRecorderApp:
             self.transcribing = True
             self.set_app_state("transcribing")
             self.set_transcription_text("Transkrypcja w toku...")
-            threading.Thread(target=self.run_transcription, args=(wave_output_filename, self.current_trigger_source, self.target_window_id), daemon=True).start()
+            threading.Thread(
+                target=self.run_transcription,
+                args=(wave_output_filename, self.current_trigger_source, self.target_window_id, self.current_record_prompt_processing_enabled),
+                daemon=True,
+            ).start()
             logging.info("Transcription thread started.")
         except Exception as e:
             messagebox.showerror("Save Error", f"Failed to save WAVE file: {e}")
@@ -2068,7 +2513,7 @@ class AudioRecorderApp:
             self.set_app_state("error")
             logging.error(f"Error saving wave file: {e}", exc_info=True)
 
-    def run_transcription(self, audio_path, trigger_source="main_button", target_window_id=None):
+    def run_transcription(self, audio_path, trigger_source="main_button", target_window_id=None, prompt_processing_for_recording=False):
         logging.info(f"Running transcription for {audio_path} in thread: {threading.get_ident()}")
         try:
             if self.asr_pipeline is None:
@@ -2091,9 +2536,30 @@ class AudioRecorderApp:
             transcription = postprocess_transcription(result["text"].strip())
             elapsed_seconds = round(time.time() - started_at, 2)
             logging.info(f"Transcription finished in {elapsed_seconds}s.")
+            processed_text = ""
+            prompt_processing_metadata = {
+                "prompt_processing_enabled_for_recording": bool(prompt_processing_for_recording),
+                "processed_text": "",
+                "prompt_processing_backend": "",
+                "prompt_processing_model": "",
+                "prompt_processing_elapsed_seconds": 0,
+                "prompt_processing_error": "",
+            }
+            if prompt_processing_for_recording and transcription.strip():
+                self.transcription_queue.put({"type": "status", "status": "Porządkowanie promptu..."})
+                prompt_result = self.process_prompt_text(transcription)
+                processed_text = prompt_result.text
+                prompt_processing_metadata.update({
+                    "processed_text": processed_text,
+                    "prompt_processing_backend": prompt_result.backend,
+                    "prompt_processing_model": prompt_result.model,
+                    "prompt_processing_elapsed_seconds": prompt_result.elapsed_seconds,
+                    "prompt_processing_error": prompt_result.error or "",
+                })
             self.transcription_queue.put({
                 "type": "transcription",
                 "text": transcription,
+                "processed_text": processed_text,
                 "audio_path": audio_path,
                 "metadata": {
                     "model_name": self.current_model_name,
@@ -2105,6 +2571,7 @@ class AudioRecorderApp:
                     "target_window_id": target_window_id,
                     "trigger_source": trigger_source,
                     "hotkey": self.global_hotkey if trigger_source == "global_hotkey" else "",
+                    **prompt_processing_metadata,
                 },
             })
         except FileNotFoundError:
@@ -2132,13 +2599,22 @@ class AudioRecorderApp:
                 model_name = queue_item.get("model_name", "selected model")
                 error = queue_item.get("error", "Unknown error")
                 messagebox.showerror("Model Loading Failed", f"Could not load {model_name}.\n\n{error}\n\nCheck transcriber.log for details.")
+            elif item_type == "status":
+                self.set_status(queue_item.get("status", "Praca w toku..."))
+            elif item_type == "llm_connection_status":
+                self.apply_llm_connection_status(queue_item["status"])
             elif item_type == "transcription":
                 self.transcribing = False
                 result = queue_item.get("text", "")
+                processed_text = queue_item.get("processed_text", "")
                 audio_path = queue_item.get("audio_path", "")
                 metadata = queue_item.get("metadata", {})
                 self.last_transcription_text = "" if is_transcription_error(result) else result
-                self.set_transcription_text(result)
+                self.last_processed_text = "" if is_transcription_error(result) else processed_text
+                self.last_prompt_processing_error = metadata.get("prompt_processing_error") or None
+                if self.last_processed_text and self.paste_output_preference == "processed":
+                    self.preview_mode = "processed"
+                self.set_preview_mode(self.preview_mode)
                 if is_transcription_error(result) or not result.strip() or is_likely_silence_hallucination(result):
                     self.set_app_state("error")
                     logging.warning("Transcription failed, returned empty text, or looked like a silence hallucination.")
@@ -2151,7 +2627,7 @@ class AudioRecorderApp:
                         self.set_status("Transkrypcja jest pusta. Nie wklejam tekstu.")
                 else:
                     logging.info("Successful transcription text_length=%s", len(result))
-                    paste_result = self.handle_successful_transcription(result, metadata)
+                    paste_result = self.handle_successful_transcription(result, metadata, processed_text)
                     metadata["copy_to_clipboard_enabled"] = self.copy_to_clipboard_enabled
                     metadata["clipboard_copied"] = paste_result.copied_to_clipboard
                     metadata["clipboard_verified"] = paste_result.clipboard_verified
@@ -2165,6 +2641,35 @@ class AudioRecorderApp:
                     self.app_state = "idle"
                     self.set_recording_widget_state("done")
                     self.recording_widget_hide_id = self.master.after(2000, self.hide_recording_widget)
+            elif item_type == "prompt_reprocessed_last":
+                prompt_result = queue_item["result"]
+                self.last_processed_text = prompt_result.text
+                self.last_prompt_processing_error = prompt_result.error
+                self.preview_mode = "processed"
+                self.set_preview_mode("processed")
+                if prompt_result.error:
+                    self.set_status(f"LLM error: {prompt_result.error}")
+                else:
+                    self.set_status("Prompt LLM gotowy")
+            elif item_type == "prompt_reprocessed_history":
+                prompt_result = queue_item["result"]
+                index = queue_item.get("index")
+                if isinstance(index, int) and 0 <= index < len(self.transcription_history):
+                    entry = self.transcription_history[index]
+                    entry["processed_text"] = prompt_result.text
+                    entry["prompt_processing_enabled_for_recording"] = True
+                    entry["prompt_processing_backend"] = prompt_result.backend
+                    entry["prompt_processing_model"] = prompt_result.model
+                    entry["prompt_processing_elapsed_seconds"] = prompt_result.elapsed_seconds
+                    entry["prompt_processing_error"] = prompt_result.error or ""
+                    self.save_history()
+                    self.history_view_mode = "processed"
+                    self.refresh_history_list(selected_index=index)
+                if prompt_result.error:
+                    self.set_status(f"LLM error: {prompt_result.error}")
+                else:
+                    self.set_status("Prompt LLM w historii zaktualizowany")
+            if item_type != "status":
                 self.update_control_states()
         except queue.Empty:
             pass
