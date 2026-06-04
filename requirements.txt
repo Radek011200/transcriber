@@ -1,0 +1,9 @@
+PyAudio
+transformers
+torch
+librosa
+pyinstaller
+pyautogui
+pynput
+pyperclip
+customtkinter
