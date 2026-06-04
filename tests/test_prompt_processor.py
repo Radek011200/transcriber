@@ -6,8 +6,11 @@ import urllib.error
 from prompt_processor import (
     DEFAULT_PROMPT_PROCESSING_SYSTEM_PROMPT,
     PromptProcessor,
+    build_ollama_payload,
     build_prompt_messages,
     check_llm_connection,
+    get_llama_cpp_model,
+    prompt_processing_num_predict,
     select_paste_output,
 )
 
@@ -47,6 +50,7 @@ class PromptProcessorTest(unittest.TestCase):
             "prompt_processing_system_prompt": DEFAULT_PROMPT_PROCESSING_SYSTEM_PROMPT,
             "prompt_processing_temperature": 0.2,
             "prompt_processing_max_tokens": 1024,
+            "prompt_processing_keep_alive": "10m",
         }
         response = mock.Mock()
         response.__enter__ = mock.Mock(return_value=response)
@@ -58,6 +62,37 @@ class PromptProcessorTest(unittest.TestCase):
 
         self.assertEqual(result.text, "Gotowy prompt")
         self.assertIsNone(result.error)
+
+    def test_ollama_payload_contains_keep_alive(self):
+        settings = {
+            "prompt_processing_model": "qwen3:1.7b",
+            "prompt_processing_temperature": 0.2,
+            "prompt_processing_max_tokens": 1024,
+            "prompt_processing_keep_alive": "10m",
+        }
+
+        payload = build_ollama_payload(settings, build_prompt_messages("System", "tekst"), "tekst")
+
+        self.assertEqual(payload["keep_alive"], "10m")
+        self.assertEqual(payload["options"]["num_predict"], 1024)
+
+    def test_prompt_processing_max_tokens_is_not_lowered_by_default(self):
+        settings = {
+            "prompt_processing_max_tokens": 2048,
+            "prompt_processing_adaptive_max_tokens": False,
+        }
+
+        self.assertEqual(prompt_processing_num_predict(settings, "krótki tekst"), 2048)
+
+    def test_llama_cpp_model_is_cached_for_same_path(self):
+        fake_llama = mock.Mock()
+
+        with mock.patch.dict("sys.modules", {"llama_cpp": mock.Mock(Llama=mock.Mock(return_value=fake_llama))}):
+            first = get_llama_cpp_model("/tmp/model.gguf", 4096)
+            second = get_llama_cpp_model("/tmp/model.gguf", 4096)
+
+        self.assertIs(first, fake_llama)
+        self.assertIs(second, fake_llama)
 
     def test_ollama_connection_error_returns_error_result(self):
         settings = {

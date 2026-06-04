@@ -1,6 +1,8 @@
 PyAudio
+numpy
 transformers
 torch
+faster-whisper
 librosa
 pyinstaller
 pyautogui

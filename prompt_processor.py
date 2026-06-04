@@ -58,6 +58,7 @@ LLM_MODEL_OPTIONS = [
 ]
 
 LLM_MODEL_OPTIONS_BY_ID = {model["id"]: model for model in LLM_MODEL_OPTIONS}
+_LLAMA_CPP_CACHE: dict[tuple[str, int], object] = {}
 
 
 @dataclass
@@ -89,6 +90,48 @@ def build_prompt_messages(system_prompt: str, transcription: str) -> list[dict]:
         {"role": "system", "content": system_prompt.strip()},
         {"role": "user", "content": f"Surowa transkrypcja:\n\n{transcription.strip()}"},
     ]
+
+
+def prompt_processing_num_predict(settings: dict, transcription: str) -> int:
+    configured_limit = int(settings.get("prompt_processing_max_tokens", 1024))
+    if not bool(settings.get("prompt_processing_adaptive_max_tokens", False)):
+        return configured_limit
+    word_count = len(transcription.split())
+    if word_count >= 220:
+        return configured_limit
+    adaptive_limit = max(256, min(configured_limit, word_count * 2 + 160))
+    return adaptive_limit
+
+
+def build_ollama_options(settings: dict, transcription: str) -> dict:
+    return {
+        "temperature": float(settings.get("prompt_processing_temperature", 0.2)),
+        "num_predict": prompt_processing_num_predict(settings, transcription),
+    }
+
+
+def build_ollama_payload(settings: dict, messages: list[dict], transcription: str) -> dict:
+    payload = {
+        "model": str(settings.get("prompt_processing_model") or "qwen3:1.7b"),
+        "messages": messages,
+        "stream": False,
+        "options": build_ollama_options(settings, transcription),
+    }
+    keep_alive = str(settings.get("prompt_processing_keep_alive") or "").strip()
+    if keep_alive:
+        payload["keep_alive"] = keep_alive
+    return payload
+
+
+def get_llama_cpp_model(gguf_path: str, n_ctx: int = 4096):
+    cache_key = (gguf_path, int(n_ctx))
+    llm = _LLAMA_CPP_CACHE.get(cache_key)
+    if llm is not None:
+        return llm
+    from llama_cpp import Llama
+    llm = Llama(model_path=gguf_path, n_ctx=int(n_ctx), verbose=False)
+    _LLAMA_CPP_CACHE[cache_key] = llm
+    return llm
 
 
 def select_paste_output(
@@ -186,15 +229,7 @@ class PromptProcessor:
     def _process_with_ollama(self, transcription: str) -> str:
         url = str(self.settings.get("prompt_processing_ollama_url") or "http://localhost:11434").rstrip("/")
         model = str(self.settings.get("prompt_processing_model") or "qwen3:1.7b")
-        payload = {
-            "model": model,
-            "messages": self._messages(transcription),
-            "stream": False,
-            "options": {
-                "temperature": float(self.settings.get("prompt_processing_temperature", 0.2)),
-                "num_predict": int(self.settings.get("prompt_processing_max_tokens", 1024)),
-            },
-        }
+        payload = build_ollama_payload(self.settings, self._messages(transcription), transcription)
         request = urllib.request.Request(
             f"{url}/api/chat",
             data=json.dumps(payload).encode("utf-8"),
@@ -231,11 +266,12 @@ class PromptProcessor:
         except Exception as e:
             raise RuntimeError("Brak llama-cpp-python. Zainstaluj pakiet albo użyj backendu Ollama.") from e
 
-        llm = Llama(model_path=gguf_path, n_ctx=4096, verbose=False)
+        n_ctx = int(self.settings.get("prompt_processing_llama_cpp_n_ctx", 4096))
+        llm = get_llama_cpp_model(gguf_path, n_ctx)
         response = llm.create_chat_completion(
             messages=self._messages(transcription),
             temperature=float(self.settings.get("prompt_processing_temperature", 0.2)),
-            max_tokens=int(self.settings.get("prompt_processing_max_tokens", 1024)),
+            max_tokens=prompt_processing_num_predict(self.settings, transcription),
         )
         choices = response.get("choices", []) if isinstance(response, dict) else []
         if not choices:

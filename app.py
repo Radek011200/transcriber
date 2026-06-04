@@ -17,6 +17,7 @@ import logging.handlers
 import re
 import shutil
 import subprocess
+import inspect
 from contextlib import contextmanager
 from typing import TextIO
 
@@ -44,12 +45,23 @@ LOG_FILENAME = "transcriber.log"
 HISTORY_FILENAME = "output/transcription-history.json"
 SETTINGS_FILENAME = "output/settings.json"
 DEFAULT_MODEL_NAME = "openai/whisper-large-v3-turbo"
+DEFAULT_CPU_MODEL_NAME = "openai/whisper-small"
 DEFAULT_LANGUAGE = "polish"
 DEFAULT_NUM_BEAMS = 5
+DEFAULT_FAST_NUM_BEAMS = 1
 DEFAULT_GLOBAL_HOTKEY = "<ctrl>+<alt>+n"
 DEFAULT_PASTE_DELAY_MS = 300
 DEFAULT_MAX_RECORD_DURATION = 120
 DEFAULT_PROMPT_PROCESSING_MODEL = "qwen3:1.7b"
+DEFAULT_ASR_QUALITY_PROFILE = "high"
+DEFAULT_ASR_BACKEND = "auto"
+DEFAULT_CORRECTION_MODE = "quick_correction"
+DEFAULT_ASR_WARMUP_ENABLED = True
+DEFAULT_ASR_TRIM_SILENCE_ENABLED = True
+ASR_BACKENDS = ("auto", "transformers", "faster-whisper", "whisper.cpp")
+ACCELERATION_PROFILES = ("cpu", "amd_gpu", "nvidia_gpu", "fallback_cpu")
+CORRECTION_MODES = ("no_llm", "quick_correction", "full_correction")
+ASR_QUALITY_PROFILES = ("fast", "accurate", "no_llm", "quick_correction", "full_correction", "high")
 MAX_RECORD_DURATION_SECONDS = 1800
 LONG_FORM_TRANSCRIPTION_THRESHOLD_SECONDS = 30
 RECORD_DURATION_PRESETS = [30, 60, 120, 180, 300, 600, 900, 1800]
@@ -133,6 +145,19 @@ POSTPROCESS_REPLACEMENTS = {
     "pi ajdio": "PyAudio",
 }
 
+FASTER_WHISPER_MODEL_IDS = {
+    "openai/whisper-tiny": "tiny",
+    "openai/whisper-small": "small",
+    "openai/whisper-medium": "medium",
+    "openai/whisper-large-v3-turbo": "large-v3-turbo",
+}
+
+WHISPER_LANGUAGE_CODES = {
+    "polish": "pl",
+    "english": "en",
+    "auto": None,
+}
+
 # --- Logging Setup ---
 class StreamToLogger(TextIO):
     """
@@ -193,11 +218,12 @@ logging.info("Application initialization started.")
 # Ensure you have installed: pip install torch transformers librosa
 # (Librosa might require ffmpeg)
 try:
+    import numpy as np
     import torch
     from transformers import pipeline
 except ImportError:
-    logging.error("ERROR: 'transformers' or 'torch' libraries not found.")
-    logging.error("Install them using: pip install torch transformers")
+    logging.error("ERROR: 'numpy', 'transformers' or 'torch' libraries not found.")
+    logging.error("Install them using: pip install numpy torch transformers")
     exit()
 
 try:
@@ -248,12 +274,80 @@ def suppress_native_stderr():
         if devnull is not None:
             devnull.close()
 
-def load_settings() -> dict:
-    """Loads user settings from disk or returns sane defaults."""
-    defaults = {
-        "selected_model": DEFAULT_MODEL_NAME,
+def detect_acceleration_profile() -> dict:
+    """Detects the broad acceleration profile without assuming that any GPU is usable."""
+    cuda_available = bool(torch.cuda.is_available())
+    cuda_version = getattr(torch.version, "cuda", None)
+    hip_version = getattr(torch.version, "hip", None)
+    gpu_name = ""
+    if cuda_available:
+        try:
+            gpu_name = str(torch.cuda.get_device_name(0))
+        except Exception as e:
+            logging.warning("Could not read GPU name: %s", e, exc_info=True)
+            gpu_name = "GPU"
+    normalized_name = gpu_name.lower()
+    is_amd_name = any(token in normalized_name for token in ("amd", "radeon", "rocm"))
+    if cuda_available and (hip_version or is_amd_name):
+        profile = "amd_gpu"
+    elif cuda_available and cuda_version:
+        profile = "nvidia_gpu"
+    elif cuda_available:
+        profile = "fallback_cpu"
+    else:
+        profile = "cpu"
+    return {
+        "profile": profile,
+        "cuda_available": cuda_available,
+        "torch_cuda_version": cuda_version or "",
+        "torch_hip_version": hip_version or "",
+        "gpu_name": gpu_name,
+        "backend": "hip" if hip_version else ("cuda" if cuda_version else "cpu"),
+    }
+
+def recommended_defaults_for_profile(profile: str) -> dict:
+    if profile == "nvidia_gpu":
+        return {
+            "selected_model": DEFAULT_MODEL_NAME,
+            "num_beams": 1,
+            "asr_quality_profile": "fast",
+            "asr_backend": "auto",
+            "correction_mode": "quick_correction",
+            "prompt_processing_default_for_recordings": False,
+        }
+    if profile == "amd_gpu":
+        return {
+            "selected_model": "openai/whisper-medium",
+            "num_beams": 1,
+            "asr_quality_profile": "fast",
+            "asr_backend": "auto",
+            "correction_mode": "quick_correction",
+            "prompt_processing_default_for_recordings": False,
+        }
+    return {
+        "selected_model": DEFAULT_CPU_MODEL_NAME,
+        "num_beams": DEFAULT_FAST_NUM_BEAMS,
+        "asr_quality_profile": "fast",
+        "asr_backend": "auto",
+        "correction_mode": "no_llm",
+        "prompt_processing_default_for_recordings": False,
+    }
+
+def default_settings_for_current_hardware() -> dict:
+    hardware = detect_acceleration_profile()
+    hardware_defaults = recommended_defaults_for_profile(hardware["profile"])
+    return {
+        "acceleration_profile": hardware["profile"],
+        "selected_model": hardware_defaults["selected_model"],
         "language": DEFAULT_LANGUAGE,
-        "num_beams": DEFAULT_NUM_BEAMS,
+        "num_beams": hardware_defaults["num_beams"],
+        "asr_quality_profile": hardware_defaults["asr_quality_profile"],
+        "asr_backend": hardware_defaults["asr_backend"],
+        "correction_mode": hardware_defaults["correction_mode"],
+        "asr_cpu_threads": max(1, (os.cpu_count() or 2) - 1),
+        "asr_warmup_enabled": DEFAULT_ASR_WARMUP_ENABLED,
+        "asr_trim_silence_enabled": DEFAULT_ASR_TRIM_SILENCE_ENABLED,
+        "asr_vad_enabled": True,
         "input_device_index": None,
         "dictation_mode_enabled": True,
         "auto_paste_enabled": True,
@@ -283,7 +377,7 @@ def load_settings() -> dict:
         "appearance_mode": "dark",
         "ui_scaling": "100%",
         "prompt_processing_enabled": True,
-        "prompt_processing_default_for_recordings": False,
+        "prompt_processing_default_for_recordings": hardware_defaults["prompt_processing_default_for_recordings"],
         "prompt_processing_backend": "ollama",
         "prompt_processing_model": DEFAULT_PROMPT_PROCESSING_MODEL,
         "prompt_processing_ollama_url": "http://localhost:11434",
@@ -291,9 +385,15 @@ def load_settings() -> dict:
         "prompt_processing_system_prompt": DEFAULT_PROMPT_PROCESSING_SYSTEM_PROMPT,
         "prompt_processing_temperature": 0.2,
         "prompt_processing_max_tokens": 1024,
+        "prompt_processing_keep_alive": "10m",
+        "prompt_processing_adaptive_max_tokens": False,
         "paste_output_preference": "original",
         "fallback_to_original_on_llm_error": True,
     }
+
+def load_settings() -> dict:
+    """Loads user settings from disk or returns sane defaults."""
+    defaults = default_settings_for_current_hardware()
     try:
         with open(settings_filename(), 'r', encoding='utf-8') as settings_file:
             settings = json.load(settings_file)
@@ -319,6 +419,14 @@ def load_settings() -> dict:
         merged_settings["prompt_processing_backend"] = "ollama"
     if merged_settings["paste_output_preference"] not in {"original", "processed"}:
         merged_settings["paste_output_preference"] = "original"
+    if merged_settings["acceleration_profile"] not in ACCELERATION_PROFILES:
+        merged_settings["acceleration_profile"] = defaults["acceleration_profile"]
+    if merged_settings["asr_backend"] not in ASR_BACKENDS:
+        merged_settings["asr_backend"] = DEFAULT_ASR_BACKEND
+    if merged_settings["correction_mode"] not in CORRECTION_MODES:
+        merged_settings["correction_mode"] = defaults["correction_mode"]
+    if merged_settings["asr_quality_profile"] not in ASR_QUALITY_PROFILES:
+        merged_settings["asr_quality_profile"] = DEFAULT_ASR_QUALITY_PROFILE
     return merged_settings
 
 def save_settings(settings: dict):
@@ -340,6 +448,135 @@ def preprocess_audio(input_path: str) -> str:
     """Hook for future normalization, silence trimming, or noise reduction."""
     return input_path
 
+def build_asr_pipeline_kwargs(model_name: str, cuda_available: bool | None = None) -> dict:
+    """Builds ASR pipeline options without changing the selected model or quality profile."""
+    if cuda_available is None:
+        cuda_available = torch.cuda.is_available()
+    kwargs = {
+        "task": "automatic-speech-recognition",
+        "model": model_name,
+        "device": 0 if cuda_available else -1,
+    }
+    if cuda_available:
+        kwargs["torch_dtype"] = torch.float16
+    return kwargs
+
+def faster_whisper_model_name(model_name: str) -> str:
+    return FASTER_WHISPER_MODEL_IDS.get(model_name, model_name)
+
+def whisper_language_code(language: str) -> str | None:
+    return WHISPER_LANGUAGE_CODES.get(language, language if language != "auto" else None)
+
+def faster_whisper_compute_type(profile: str) -> str:
+    if profile == "nvidia_gpu":
+        return "float16"
+    return "int8"
+
+class FasterWhisperPipelineAdapter:
+    """Small callable adapter matching the subset of transformers.pipeline used by this app."""
+    def __init__(self, model_name: str, device: str, compute_type: str, cpu_threads: int, vad_enabled: bool):
+        from faster_whisper import WhisperModel
+
+        self.model_name = faster_whisper_model_name(model_name)
+        self.device = device
+        self.compute_type = compute_type
+        self.vad_enabled = bool(vad_enabled)
+        self.model = WhisperModel(
+            self.model_name,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=max(1, int(cpu_threads)),
+        )
+
+    def __call__(self, audio_input: dict, **kwargs) -> dict:
+        generate_kwargs = kwargs.get("generate_kwargs") or {}
+        beam_size = int(generate_kwargs.get("num_beams") or 1)
+        language = whisper_language_code(str(generate_kwargs.get("language") or "auto"))
+        segments, _info = self.model.transcribe(
+            audio_input["array"],
+            language=language,
+            beam_size=beam_size,
+            vad_filter=self.vad_enabled,
+        )
+        return {"text": " ".join(segment.text.strip() for segment in segments).strip()}
+
+def configure_torch_cpu_threads(thread_count: int) -> None:
+    thread_count = max(1, int(thread_count))
+    try:
+        torch.set_num_threads(thread_count)
+        torch.set_num_interop_threads(1)
+        logging.info("Configured torch CPU threads: intraop=%s interop=1", thread_count)
+    except Exception as e:
+        logging.warning("Could not configure torch CPU threads: %s", e, exc_info=True)
+
+def create_asr_generate_kwargs(language: str, num_beams: int) -> dict:
+    generate_kwargs = {"task": "transcribe", "num_beams": int(num_beams)}
+    if language != "auto":
+        generate_kwargs["language"] = language
+    return generate_kwargs
+
+def build_asr_call_kwargs(duration_seconds: float, generate_kwargs: dict) -> dict:
+    call_kwargs = {"generate_kwargs": generate_kwargs}
+    if duration_seconds > LONG_FORM_TRANSCRIPTION_THRESHOLD_SECONDS:
+        call_kwargs["return_timestamps"] = True
+    return call_kwargs
+
+def int16_frames_to_samples(frames: list[bytes]) -> np.ndarray:
+    if not frames:
+        return np.array([], dtype=np.int16)
+    audio_bytes = b"".join(frames)
+    samples = np.frombuffer(audio_bytes, dtype="<i2")
+    return samples.copy()
+
+def trim_edge_silence(samples: np.ndarray, sample_rate: int = 16000, threshold: int = 240, keep_seconds: float = 0.20, window_seconds: float = 0.10) -> np.ndarray:
+    """Conservatively trims only quiet leading/trailing edges from int16 mono audio."""
+    if samples.size == 0:
+        return samples
+    window_size = max(1, int(sample_rate * window_seconds))
+    keep = max(0, int(sample_rate * keep_seconds))
+    non_silent_start = 0
+    non_silent_end = samples.size
+
+    abs_samples = np.abs(samples.astype(np.int32, copy=False))
+    for start in range(0, samples.size, window_size):
+        if int(abs_samples[start:start + window_size].max(initial=0)) >= threshold:
+            non_silent_start = max(0, start - keep)
+            break
+    else:
+        return samples
+
+    for end in range(samples.size, 0, -window_size):
+        start = max(0, end - window_size)
+        if int(abs_samples[start:end].max(initial=0)) >= threshold:
+            non_silent_end = min(samples.size, end + keep)
+            break
+
+    if non_silent_start >= non_silent_end:
+        return samples
+    return samples[non_silent_start:non_silent_end]
+
+def audio_frames_to_asr_input(frames: list[bytes], trim_silence_enabled: bool = True) -> tuple[dict, dict]:
+    """Converts PyAudio int16 frames to the in-memory input accepted by transformers ASR pipelines."""
+    started_at = time.time()
+    raw_samples = int16_frames_to_samples(frames)
+    original_sample_count = int(raw_samples.size)
+    samples = trim_edge_silence(raw_samples, RATE) if trim_silence_enabled else raw_samples
+    trimmed_sample_count = int(samples.size)
+    if samples.size:
+        audio_array = (samples.astype(np.float32) / 32768.0).clip(-1.0, 1.0)
+    else:
+        audio_array = np.array([], dtype=np.float32)
+    duration_seconds = round(trimmed_sample_count / float(RATE), 2) if RATE else 0.0
+    original_duration_seconds = round(original_sample_count / float(RATE), 2) if RATE else 0.0
+    metrics = {
+        "audio_prepare_elapsed_seconds": round(time.time() - started_at, 3),
+        "duration_seconds": duration_seconds,
+        "original_duration_seconds": original_duration_seconds,
+        "trimmed_duration_seconds": round(max(0.0, original_duration_seconds - duration_seconds), 2),
+        "trim_silence_enabled": bool(trim_silence_enabled),
+    }
+    return {"array": audio_array, "sampling_rate": RATE}, metrics
+
 def get_audio_duration_seconds(audio_path: str) -> float:
     """Returns WAV duration in seconds when possible."""
     try:
@@ -350,12 +587,6 @@ def get_audio_duration_seconds(audio_path: str) -> float:
     except (wave.Error, OSError) as e:
         logging.warning(f"Could not calculate audio duration for {audio_path}: {e}")
         return 0.0
-
-def build_asr_call_kwargs(duration_seconds: float, generate_kwargs: dict) -> dict:
-    call_kwargs = {"generate_kwargs": generate_kwargs}
-    if duration_seconds > LONG_FORM_TRANSCRIPTION_THRESHOLD_SECONDS:
-        call_kwargs["return_timestamps"] = True
-    return call_kwargs
 
 def detect_session_type() -> str:
     """Returns x11, wayland, or unknown based on the Linux session."""
@@ -492,9 +723,18 @@ class AudioRecorderApp:
         self.history_cards = []
         self.settings = load_settings()
 
+        self.hardware_profile = detect_acceleration_profile()
+        self.acceleration_profile = self.hardware_profile["profile"]
         self.selected_model_name = self.settings["selected_model"]
         self.language = self.settings["language"]
         self.num_beams = int(self.settings["num_beams"])
+        self.asr_quality_profile = str(self.settings["asr_quality_profile"])
+        self.asr_backend = str(self.settings.get("asr_backend", DEFAULT_ASR_BACKEND))
+        self.correction_mode = str(self.settings.get("correction_mode", DEFAULT_CORRECTION_MODE))
+        self.asr_cpu_threads = int(self.settings.get("asr_cpu_threads", max(1, (os.cpu_count() or 2) - 1)))
+        self.asr_warmup_enabled = bool(self.settings["asr_warmup_enabled"])
+        self.asr_trim_silence_enabled = bool(self.settings["asr_trim_silence_enabled"])
+        self.asr_vad_enabled = bool(self.settings.get("asr_vad_enabled", True))
         self.input_device_index = self.normalize_input_device_index(self.settings.get("input_device_index"))
         self.max_record_duration_seconds = int(self.settings.get("max_record_duration_seconds", DEFAULT_MAX_RECORD_DURATION))
         self.max_record_duration = self.max_record_duration_seconds
@@ -530,11 +770,15 @@ class AudioRecorderApp:
         self.prompt_processing_system_prompt = str(self.settings["prompt_processing_system_prompt"])
         self.prompt_processing_temperature = float(self.settings["prompt_processing_temperature"])
         self.prompt_processing_max_tokens = int(self.settings["prompt_processing_max_tokens"])
+        self.prompt_processing_keep_alive = str(self.settings["prompt_processing_keep_alive"])
+        self.prompt_processing_adaptive_max_tokens = bool(self.settings["prompt_processing_adaptive_max_tokens"])
         self.paste_output_preference = str(self.settings["paste_output_preference"])
         self.fallback_to_original_on_llm_error = bool(self.settings["fallback_to_original_on_llm_error"])
 
         self.asr_pipeline = None
         self.current_model_name = None
+        self.current_asr_backend = ""
+        self.current_asr_compute_type = ""
         self.model_loading = False
         self.transcribing = False
         self.app_state = "idle"
@@ -575,7 +819,8 @@ class AudioRecorderApp:
         self.recording_overlay_stage_item = None
         self.processing_wave_phase = 0
         self.recording_overlay_drag_offset = (0, 0)
-        self.device_id = 0 if torch.cuda.is_available() else -1
+        configure_torch_cpu_threads(self.asr_cpu_threads)
+        self.device_id = 0 if torch.cuda.is_available() and self.acceleration_profile in {"nvidia_gpu", "amd_gpu"} else -1
         self.device_name = self.detect_device_name()
         self.audio_input_devices = self.get_audio_input_devices()
         self.transcription_queue = queue.Queue()
@@ -583,8 +828,7 @@ class AudioRecorderApp:
         self.clipboard_manager = ClipboardManager(self.master, self.session_type)
         self.paste_manager = self.create_paste_manager()
 
-        logging.info(f"CUDA available: {torch.cuda.is_available()}")
-        logging.info(f"CUDA version: {torch.version.cuda}")
+        logging.info("Acceleration profile: %s", self.hardware_profile)
         logging.info(f"Detected transcription device: {self.device_name}")
         logging.info(f"Detected session type: {self.session_type}")
         self.log_audio_input_devices()
@@ -620,12 +864,15 @@ class AudioRecorderApp:
         )
 
     def detect_device_name(self) -> str:
-        if torch.cuda.is_available():
+        if self.acceleration_profile in {"nvidia_gpu", "amd_gpu"} and torch.cuda.is_available():
             try:
-                return f"CUDA: {torch.cuda.get_device_name(0)}"
+                label = "ROCm/HIP" if self.acceleration_profile == "amd_gpu" else "CUDA"
+                return f"{label}: {torch.cuda.get_device_name(0)}"
             except Exception as e:
-                logging.warning(f"Could not read CUDA device name: {e}", exc_info=True)
-                return "CUDA"
+                logging.warning(f"Could not read GPU device name: {e}", exc_info=True)
+                return self.acceleration_profile
+        if self.acceleration_profile == "fallback_cpu":
+            return "CPU fallback"
         return "CPU"
 
     def normalize_input_device_index(self, value) -> int | None:
@@ -980,6 +1227,13 @@ class AudioRecorderApp:
 
         self.language_var = tk.StringVar(value=self.language)
         self.num_beams_var = tk.StringVar(value=str(self.num_beams))
+        self.asr_quality_profile_var = tk.StringVar(value=self.asr_quality_profile)
+        self.asr_backend_var = tk.StringVar(value=self.asr_backend)
+        self.correction_mode_var = tk.StringVar(value=self.correction_mode)
+        self.asr_cpu_threads_var = tk.StringVar(value=str(self.asr_cpu_threads))
+        self.asr_warmup_enabled_var = tk.BooleanVar(value=self.asr_warmup_enabled)
+        self.asr_trim_silence_enabled_var = tk.BooleanVar(value=self.asr_trim_silence_enabled)
+        self.asr_vad_enabled_var = tk.BooleanVar(value=self.asr_vad_enabled)
         record_duration_options = [f"{seconds} s" for seconds in RECORD_DURATION_PRESETS] + ["Custom"]
         self.record_duration_preset_var = tk.StringVar(value=self.record_duration_preset if self.record_duration_preset in record_duration_options else f"{self.max_record_duration_seconds} s")
         if self.record_duration_preset_var.get() not in record_duration_options:
@@ -1052,7 +1306,18 @@ class AudioRecorderApp:
         ctk.CTkOptionMenu(card, values=["polish", "english", "auto"], variable=self.language_var).grid(row=1, column=1, padx=14, pady=8, sticky="ew")
         ctk.CTkLabel(card, text="Num beams").grid(row=2, column=0, padx=14, pady=8, sticky="w")
         ctk.CTkOptionMenu(card, values=["1", "3", "5"], variable=self.num_beams_var).grid(row=2, column=1, padx=14, pady=8, sticky="ew")
-        ctk.CTkSwitch(card, text="Domyślnie generuj prompt LLM", variable=self.prompt_processing_default_var).grid(row=3, column=0, columnspan=2, padx=14, pady=(8, 14), sticky="w")
+        ctk.CTkLabel(card, text="Profil jakości ASR").grid(row=3, column=0, padx=14, pady=8, sticky="w")
+        ctk.CTkOptionMenu(card, values=list(ASR_QUALITY_PROFILES), variable=self.asr_quality_profile_var, command=self.on_asr_preset_change).grid(row=3, column=1, padx=14, pady=8, sticky="ew")
+        ctk.CTkLabel(card, text="Backend STT").grid(row=4, column=0, padx=14, pady=8, sticky="w")
+        ctk.CTkOptionMenu(card, values=list(ASR_BACKENDS), variable=self.asr_backend_var).grid(row=4, column=1, padx=14, pady=8, sticky="ew")
+        ctk.CTkLabel(card, text="Tryb korekty").grid(row=5, column=0, padx=14, pady=8, sticky="w")
+        ctk.CTkOptionMenu(card, values=list(CORRECTION_MODES), variable=self.correction_mode_var).grid(row=5, column=1, padx=14, pady=8, sticky="ew")
+        ctk.CTkLabel(card, text="Wątki CPU ASR").grid(row=6, column=0, padx=14, pady=8, sticky="w")
+        ctk.CTkEntry(card, textvariable=self.asr_cpu_threads_var).grid(row=6, column=1, padx=14, pady=8, sticky="ew")
+        ctk.CTkSwitch(card, text="Warm-up modelu po załadowaniu", variable=self.asr_warmup_enabled_var).grid(row=7, column=0, columnspan=2, padx=14, pady=6, sticky="w")
+        ctk.CTkSwitch(card, text="Przytnij ciszę na początku i końcu", variable=self.asr_trim_silence_enabled_var).grid(row=8, column=0, columnspan=2, padx=14, pady=6, sticky="w")
+        ctk.CTkSwitch(card, text="VAD w backendach, które go obsługują", variable=self.asr_vad_enabled_var).grid(row=9, column=0, columnspan=2, padx=14, pady=6, sticky="w")
+        ctk.CTkSwitch(card, text="Domyślnie generuj prompt LLM", variable=self.prompt_processing_default_var).grid(row=10, column=0, columnspan=2, padx=14, pady=(8, 14), sticky="w")
 
     def build_paste_settings_card(self, parent, row: int, column: int):
         card = ctk.CTkFrame(parent)
@@ -1106,6 +1371,8 @@ class AudioRecorderApp:
         self.prompt_processing_gguf_path_var = tk.StringVar(value=self.prompt_processing_gguf_path)
         self.prompt_processing_temperature_var = tk.StringVar(value=str(self.prompt_processing_temperature))
         self.prompt_processing_max_tokens_var = tk.StringVar(value=str(self.prompt_processing_max_tokens))
+        self.prompt_processing_keep_alive_var = tk.StringVar(value=self.prompt_processing_keep_alive)
+        self.prompt_processing_adaptive_max_tokens_var = tk.BooleanVar(value=self.prompt_processing_adaptive_max_tokens)
         self.paste_output_preference_var = tk.StringVar(value=self.paste_output_preference)
         self.fallback_to_original_on_llm_error_var = tk.BooleanVar(value=self.fallback_to_original_on_llm_error)
 
@@ -1129,15 +1396,18 @@ class AudioRecorderApp:
         ctk.CTkEntry(card, textvariable=self.prompt_processing_temperature_var).grid(row=7, column=1, padx=14, pady=8, sticky="ew")
         ctk.CTkLabel(card, text="Max tokenów").grid(row=8, column=0, padx=14, pady=8, sticky="w")
         ctk.CTkEntry(card, textvariable=self.prompt_processing_max_tokens_var).grid(row=8, column=1, padx=14, pady=8, sticky="ew")
-        ctk.CTkLabel(card, text="Wklejaj").grid(row=9, column=0, padx=14, pady=8, sticky="w")
-        ctk.CTkOptionMenu(card, values=["original", "processed"], variable=self.paste_output_preference_var).grid(row=9, column=1, padx=14, pady=8, sticky="ew")
-        ctk.CTkSwitch(card, text="Fallback do oryginału przy błędzie LLM", variable=self.fallback_to_original_on_llm_error_var).grid(row=10, column=0, columnspan=2, padx=14, pady=6, sticky="w")
-        ctk.CTkLabel(card, text="Prompt systemowy").grid(row=11, column=0, padx=14, pady=8, sticky="w")
+        ctk.CTkLabel(card, text="Ollama keep_alive").grid(row=9, column=0, padx=14, pady=8, sticky="w")
+        ctk.CTkEntry(card, textvariable=self.prompt_processing_keep_alive_var).grid(row=9, column=1, padx=14, pady=8, sticky="ew")
+        ctk.CTkSwitch(card, text="Adaptacyjny limit wyjścia", variable=self.prompt_processing_adaptive_max_tokens_var).grid(row=10, column=0, columnspan=2, padx=14, pady=6, sticky="w")
+        ctk.CTkLabel(card, text="Wklejaj").grid(row=11, column=0, padx=14, pady=8, sticky="w")
+        ctk.CTkOptionMenu(card, values=["original", "processed"], variable=self.paste_output_preference_var).grid(row=11, column=1, padx=14, pady=8, sticky="ew")
+        ctk.CTkSwitch(card, text="Fallback do oryginału przy błędzie LLM", variable=self.fallback_to_original_on_llm_error_var).grid(row=12, column=0, columnspan=2, padx=14, pady=6, sticky="w")
+        ctk.CTkLabel(card, text="Prompt systemowy").grid(row=13, column=0, padx=14, pady=8, sticky="w")
         self.prompt_processing_system_prompt_textbox = ctk.CTkTextbox(card, height=132, wrap="word")
-        self.prompt_processing_system_prompt_textbox.grid(row=12, column=0, columnspan=2, padx=14, pady=(0, 8), sticky="ew")
+        self.prompt_processing_system_prompt_textbox.grid(row=14, column=0, columnspan=2, padx=14, pady=(0, 8), sticky="ew")
         self.prompt_processing_system_prompt_textbox.insert("end", self.prompt_processing_system_prompt)
         llm_buttons = ctk.CTkFrame(card, fg_color="transparent")
-        llm_buttons.grid(row=13, column=0, columnspan=2, padx=8, pady=(0, 14), sticky="ew")
+        llm_buttons.grid(row=15, column=0, columnspan=2, padx=8, pady=(0, 14), sticky="ew")
         llm_buttons.grid_columnconfigure(0, weight=1)
         llm_buttons.grid_columnconfigure(1, weight=1)
         ctk.CTkButton(llm_buttons, text="Zapisz ustawienia LLM", height=38, command=self.save_prompt_processing_settings_from_ui).grid(row=0, column=0, padx=6, sticky="ew")
@@ -1525,6 +1795,26 @@ class AudioRecorderApp:
             self.persist_settings()
         self.update_status_cards()
 
+    def on_asr_preset_change(self, preset: str | None = None):
+        if preset is None:
+            preset = self.asr_quality_profile_var.get() if hasattr(self, "asr_quality_profile_var") else self.asr_quality_profile
+        if not hasattr(self, "num_beams_var"):
+            return
+        if preset in {"fast", "no_llm", "quick_correction"}:
+            self.num_beams_var.set("1")
+        elif preset in {"accurate", "full_correction"}:
+            self.num_beams_var.set("3")
+        if hasattr(self, "correction_mode_var"):
+            if preset == "no_llm":
+                self.correction_mode_var.set("no_llm")
+                self.prompt_processing_default_var.set(False)
+            elif preset == "full_correction":
+                self.correction_mode_var.set("full_correction")
+                self.prompt_processing_default_var.set(True)
+            elif preset == "quick_correction":
+                self.correction_mode_var.set("quick_correction")
+                self.prompt_processing_default_var.set(True)
+
     def can_process_prompt(self) -> tuple[bool, str]:
         if not self.prompt_processing_enabled:
             return False, "Porządkowanie LLM jest wyłączone w ustawieniach."
@@ -1662,7 +1952,8 @@ class AudioRecorderApp:
         self.status_card_subvalue.configure(text=self.app_state)
         current_model = self.current_model_name or "Nie załadowano"
         self.model_card_value.configure(text=self.short_model_name(current_model))
-        self.model_card_subvalue.configure(text=self.device_name)
+        backend = self.current_asr_backend or self.asr_backend
+        self.model_card_subvalue.configure(text=f"{self.device_name}\n{backend}")
         self.autopaste_card_value.configure(text="ON" if self.auto_paste_enabled else "OFF")
         last_paste = "brak próby"
         if self.last_paste_result:
@@ -1681,7 +1972,7 @@ class AudioRecorderApp:
             )
         )
         self.sidebar_model_label.configure(text=f"Model: {self.short_model_name(current_model)}")
-        self.sidebar_device_label.configure(text=f"Device: {self.device_name}")
+        self.sidebar_device_label.configure(text=f"Device: {self.device_name} ({self.acceleration_profile})")
         self.sidebar_session_label.configure(text=f"Session: {self.session_type}")
 
     def llm_dashboard_subvalue(self) -> str:
@@ -1774,6 +2065,8 @@ class AudioRecorderApp:
             "prompt_processing_system_prompt": self.prompt_processing_system_prompt,
             "prompt_processing_temperature": self.prompt_processing_temperature,
             "prompt_processing_max_tokens": self.prompt_processing_max_tokens,
+            "prompt_processing_keep_alive": self.prompt_processing_keep_alive,
+            "prompt_processing_adaptive_max_tokens": self.prompt_processing_adaptive_max_tokens,
         })
         return dict(self.settings)
 
@@ -1871,6 +2164,14 @@ class AudioRecorderApp:
             "selected_model": self.selected_model_name,
             "language": self.language,
             "num_beams": self.num_beams,
+            "asr_quality_profile": self.asr_quality_profile,
+            "asr_backend": self.asr_backend,
+            "correction_mode": self.correction_mode,
+            "acceleration_profile": self.acceleration_profile,
+            "asr_cpu_threads": self.asr_cpu_threads,
+            "asr_warmup_enabled": self.asr_warmup_enabled,
+            "asr_trim_silence_enabled": self.asr_trim_silence_enabled,
+            "asr_vad_enabled": self.asr_vad_enabled,
             "input_device_index": self.input_device_index,
             "max_record_duration": self.max_record_duration_seconds,
             "max_record_duration_seconds": self.max_record_duration_seconds,
@@ -1908,6 +2209,8 @@ class AudioRecorderApp:
             "prompt_processing_system_prompt": self.prompt_processing_system_prompt,
             "prompt_processing_temperature": self.prompt_processing_temperature,
             "prompt_processing_max_tokens": self.prompt_processing_max_tokens,
+            "prompt_processing_keep_alive": self.prompt_processing_keep_alive,
+            "prompt_processing_adaptive_max_tokens": self.prompt_processing_adaptive_max_tokens,
             "paste_output_preference": self.paste_output_preference,
             "fallback_to_original_on_llm_error": self.fallback_to_original_on_llm_error,
         })
@@ -1928,6 +2231,8 @@ class AudioRecorderApp:
         self.prompt_processing_system_prompt = system_prompt or DEFAULT_PROMPT_PROCESSING_SYSTEM_PROMPT
         self.prompt_processing_temperature = max(0.0, min(2.0, float(self.prompt_processing_temperature_var.get())))
         self.prompt_processing_max_tokens = max(64, min(8192, int(self.prompt_processing_max_tokens_var.get())))
+        self.prompt_processing_keep_alive = self.prompt_processing_keep_alive_var.get().strip() or "10m"
+        self.prompt_processing_adaptive_max_tokens = self.prompt_processing_adaptive_max_tokens_var.get()
         self.paste_output_preference = self.paste_output_preference_var.get()
         self.fallback_to_original_on_llm_error = self.fallback_to_original_on_llm_error_var.get()
 
@@ -1956,6 +2261,13 @@ class AudioRecorderApp:
         try:
             self.language = self.language_var.get()
             self.num_beams = int(self.num_beams_var.get())
+            self.asr_quality_profile = self.asr_quality_profile_var.get()
+            self.asr_backend = self.asr_backend_var.get()
+            self.correction_mode = self.correction_mode_var.get()
+            self.asr_cpu_threads = max(1, int(self.asr_cpu_threads_var.get()))
+            self.asr_warmup_enabled = self.asr_warmup_enabled_var.get()
+            self.asr_trim_silence_enabled = self.asr_trim_silence_enabled_var.get()
+            self.asr_vad_enabled = self.asr_vad_enabled_var.get()
             self.input_device_index = self.parse_input_device_label(self.input_device_var.get())
             self.record_duration_preset = self.record_duration_preset_var.get()
             self.custom_record_duration_seconds = int(self.custom_record_duration_var.get())
@@ -1991,6 +2303,9 @@ class AudioRecorderApp:
             messagebox.showerror("Settings Error", f"Invalid numeric setting: {e}")
             return
 
+        if self.correction_mode == "no_llm":
+            self.prompt_processing_default_for_recordings = False
+        configure_torch_cpu_threads(self.asr_cpu_threads)
         ctk.set_appearance_mode(self.appearance_mode_var.get())
         scaling = int(self.ui_scaling_var.get().replace("%", "")) / 100
         ctk.set_widget_scaling(scaling)
@@ -2035,9 +2350,13 @@ class AudioRecorderApp:
         cuda_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "n/a"
         self.device_label.configure(
             text=(
-                f"CUDA available: {torch.cuda.is_available()}\n"
-                f"CUDA device: {cuda_name}\n"
-                f"torch CUDA version: {torch.version.cuda}\n"
+                f"Profil: {self.acceleration_profile}\n"
+                f"Backend STT: {self.current_asr_backend or self.asr_backend}\n"
+                f"Compute type: {self.current_asr_compute_type or 'n/a'}\n"
+                f"GPU available: {torch.cuda.is_available()}\n"
+                f"GPU device: {cuda_name}\n"
+                f"torch CUDA version: {getattr(torch.version, 'cuda', None)}\n"
+                f"torch HIP version: {getattr(torch.version, 'hip', None)}\n"
                 f"Fallback: {'GPU' if self.device_id != -1 else 'CPU'}"
             )
         )
@@ -2045,9 +2364,9 @@ class AudioRecorderApp:
 
     def model_recommendation_text(self) -> str:
         if torch.cuda.is_available():
-            first = "CUDA dostępna: rekomendowany openai/whisper-large-v3-turbo."
+            first = f"{self.acceleration_profile}: rekomendowany backend {self.asr_backend}."
         else:
-            first = "CPU only: rekomendowany openai/whisper-small."
+            first = "CPU only: rekomendowany faster-whisper small int8, beam 1."
         return (
             "Rekomendacja\n\n"
             f"{first}\n"
@@ -2081,8 +2400,13 @@ class AudioRecorderApp:
                 f"XDG_SESSION_TYPE: {self.session_type}\n"
                 f"Python: {sys.version.split()[0]}\n"
                 f"torch: {getattr(torch, '__version__', 'unknown')}\n"
-                f"CUDA available: {torch.cuda.is_available()}\n"
-                f"CUDA device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'n/a'}\n"
+                f"Acceleration profile: {self.acceleration_profile}\n"
+                f"Detected hardware: {self.hardware_profile}\n"
+                f"ASR backend: {self.current_asr_backend or self.asr_backend}\n"
+                f"ASR compute type: {self.current_asr_compute_type or 'n/a'}\n"
+                f"ASR CPU threads: {self.asr_cpu_threads}\n"
+                f"CUDA/HIP available: {torch.cuda.is_available()}\n"
+                f"GPU device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'n/a'}\n"
                 f"Selected input device: {self.input_device_index if self.input_device_index is not None else 'system default'}\n"
                 f"Audio input devices:\n{audio_devices_text}"
             )
@@ -2095,6 +2419,7 @@ class AudioRecorderApp:
                 f"pyautogui: {self.module_available('pyautogui')}\n"
                 f"pynput: {keyboard is not None}\n"
                 f"pyperclip: {self.module_available('pyperclip')}\n"
+                f"faster_whisper: {self.module_available('faster_whisper')}\n"
                 f"llama_cpp: {self.module_available('llama_cpp')}\n"
                 f"Ollama URL: {self.prompt_processing_ollama_url}\n"
                 f"LLM backend: {self.prompt_processing_backend}\n"
@@ -2139,16 +2464,77 @@ class AudioRecorderApp:
 
     def load_model_worker(self, model_name: str):
         try:
-            loaded_pipeline = self.create_asr_pipeline(model_name)
-            self.transcription_queue.put({"type": "model_loaded", "model_name": model_name, "pipeline": loaded_pipeline})
+            loaded_pipeline, backend, compute_type = self.create_asr_pipeline(model_name)
+            self.transcription_queue.put({
+                "type": "model_loaded",
+                "model_name": model_name,
+                "pipeline": loaded_pipeline,
+                "backend": backend,
+                "compute_type": compute_type,
+            })
         except Exception as e:
             logging.error(f"Could not load model {model_name}: {e}", exc_info=True)
             self.transcription_queue.put({"type": "model_error", "model_name": model_name, "error": str(e)})
 
+    def resolve_asr_backend(self, model_name: str) -> str:
+        requested_backend = self.asr_backend
+        if requested_backend != "auto":
+            return requested_backend
+        if self.acceleration_profile == "amd_gpu":
+            return "transformers"
+        if model_name in FASTER_WHISPER_MODEL_IDS:
+            return "faster-whisper"
+        return "transformers"
+
     def create_asr_pipeline(self, model_name: str):
-        device = 0 if torch.cuda.is_available() else -1
-        logging.info(f"Creating ASR pipeline for {model_name} on device={device}.")
-        return pipeline("automatic-speech-recognition", model=model_name, device=device)
+        backend = self.resolve_asr_backend(model_name)
+        if backend == "faster-whisper" and model_name in FASTER_WHISPER_MODEL_IDS:
+            try:
+                device = "cuda" if self.acceleration_profile == "nvidia_gpu" else "cpu"
+                compute_type = faster_whisper_compute_type(self.acceleration_profile)
+                logging.info(
+                    "Creating faster-whisper pipeline for %s on device=%s compute_type=%s cpu_threads=%s.",
+                    model_name,
+                    device,
+                    compute_type,
+                    self.asr_cpu_threads,
+                )
+                loaded_pipeline = FasterWhisperPipelineAdapter(model_name, device, compute_type, self.asr_cpu_threads, self.asr_vad_enabled)
+                if self.asr_warmup_enabled:
+                    self.warmup_asr_pipeline(loaded_pipeline)
+                return loaded_pipeline, "faster-whisper", compute_type
+            except Exception as e:
+                logging.warning("faster-whisper backend unavailable or failed, falling back to transformers: %s", e, exc_info=True)
+                if self.asr_backend == "faster-whisper":
+                    raise
+                backend = "transformers"
+        if backend == "whisper.cpp":
+            raise RuntimeError("Backend whisper.cpp is not implemented yet. Choose auto, transformers, or faster-whisper.")
+        kwargs = build_asr_pipeline_kwargs(model_name)
+        logging.info(
+            "Creating ASR pipeline for %s on device=%s torch_dtype=%s.",
+            model_name,
+            kwargs["device"],
+            kwargs.get("torch_dtype", "default"),
+        )
+        pipeline_signature = inspect.signature(pipeline)
+        accepts_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in pipeline_signature.parameters.values())
+        if not accepts_kwargs:
+            kwargs = {key: value for key, value in kwargs.items() if key in pipeline_signature.parameters}
+        loaded_pipeline = pipeline(**kwargs)
+        if self.asr_warmup_enabled:
+            self.warmup_asr_pipeline(loaded_pipeline)
+        return loaded_pipeline, "transformers", str(kwargs.get("torch_dtype", "default"))
+
+    def warmup_asr_pipeline(self, loaded_pipeline) -> None:
+        try:
+            started_at = time.time()
+            warmup_audio = {"array": np.zeros(int(RATE * 0.25), dtype=np.float32), "sampling_rate": RATE}
+            generate_kwargs = create_asr_generate_kwargs(self.language, self.num_beams)
+            loaded_pipeline(warmup_audio, **build_asr_call_kwargs(0.25, generate_kwargs))
+            logging.info("ASR warm-up finished in %.2fs.", time.time() - started_at)
+        except Exception as e:
+            logging.warning("ASR warm-up failed and will be skipped: %s", e, exc_info=True)
 
     def load_history(self):
         try:
@@ -2220,11 +2606,17 @@ class AudioRecorderApp:
             card.configure(fg_color=("#2b5f87", "#1f4f72") if card_index == index else ("gray86", "gray17"))
         entry = self.transcription_history[index]
         timestamp = format_history_timestamp(entry.get("timestamp", time.time()))
+        performance = entry.get("performance_metrics") if isinstance(entry.get("performance_metrics"), dict) else {}
         metadata = (
             f"Data: {timestamp}\n"
             f"Audio: {entry.get('audio_path', 'unknown')}\n"
             f"Model: {entry.get('model_name', 'unknown')}\n"
             f"Device: {entry.get('device', 'unknown')}\n"
+            f"Duration: {entry.get('duration_seconds', 'n/a')} s\n"
+            f"Audio prepare: {performance.get('audio_prepare_elapsed_seconds', entry.get('audio_prepare_elapsed_seconds', 'n/a'))} s\n"
+            f"ASR time: {entry.get('asr_elapsed_seconds', performance.get('asr_elapsed_seconds', 'n/a'))} s\n"
+            f"Clipboard/paste time: {entry.get('clipboard_paste_elapsed_seconds', performance.get('clipboard_paste_elapsed_seconds', 'n/a'))} s\n"
+            f"Total after stop: {entry.get('total_after_stop_elapsed_seconds', 'n/a')} s\n"
             f"Paste success: {entry.get('paste_success', False)}\n"
             f"Paste method: {entry.get('paste_method', 'unknown')}\n"
             f"Paste output: {entry.get('paste_output_used', 'unknown')}\n"
@@ -2317,8 +2709,9 @@ class AudioRecorderApp:
         return result
 
     def handle_successful_transcription(self, transcription: str, metadata: dict, processed_text: str = "") -> PasteResult:
+        paste_started_at = time.time()
         effective_paste_preference = self.paste_output_preference
-        if metadata.get("prompt_processing_enabled_for_recording"):
+        if metadata.get("prompt_processing_enabled_for_recording") and metadata.get("correction_mode") == "full_correction":
             effective_paste_preference = "processed"
         output_text, output_used = select_paste_output(
             transcription,
@@ -2341,6 +2734,7 @@ class AudioRecorderApp:
         fallback_result = PasteResult(False, "fallback_manual_clipboard_only", None, False, False, False, metadata.get("target_window_id"), self.session_type, time.strftime("%Y-%m-%dT%H:%M:%S"))
         if not prepared_text.strip() or is_transcription_error(prepared_text):
             fallback_result.error = "Prepared text is empty or an error."
+            self.record_paste_metric(metadata, paste_started_at)
             self.set_status("Gotowe")
             return fallback_result
         if self.dictation_mode_enabled and self.auto_paste_enabled and self.auto_paste_after_transcription:
@@ -2353,6 +2747,7 @@ class AudioRecorderApp:
             else:
                 self.set_status("Auto-paste nieudany, tekst jest w schowku")
                 show_desktop_notification(APP_TITLE, "Could not auto-paste. Text copied to clipboard.")
+            self.record_paste_metric(metadata, paste_started_at)
             return paste_result
         if self.copy_to_clipboard_enabled:
             copied = self.copy_to_clipboard(prepared_text)
@@ -2360,7 +2755,15 @@ class AudioRecorderApp:
             fallback_result.copied_to_clipboard = copied
             fallback_result.clipboard_verified = verified
             fallback_result.error = None if copied else "Could not copy text to clipboard."
+        self.record_paste_metric(metadata, paste_started_at)
         return fallback_result
+
+    def record_paste_metric(self, metadata: dict, started_at: float) -> None:
+        elapsed = round(time.time() - started_at, 3)
+        metadata["clipboard_paste_elapsed_seconds"] = elapsed
+        performance_metrics = metadata.setdefault("performance_metrics", {})
+        if isinstance(performance_metrics, dict):
+            performance_metrics["clipboard_paste_elapsed_seconds"] = elapsed
 
     def test_auto_paste(self):
         test_text = "Test auto-paste z Azor Transcriber"
@@ -2398,6 +2801,25 @@ class AudioRecorderApp:
         targets = self.clipboard_manager.get_targets()
         self.append_diagnostic_output(f"Test copy text/plain\ncopied: {copied}\nverified: {verified}\nTARGETS: {targets}")
         self.set_status("Test text/plain zakończony")
+
+    def save_recording_wav(self, audio_path: str, frames: list[bytes]) -> dict:
+        started_at = time.time()
+        with wave.open(audio_path, "wb") as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(self.p.get_sample_size(FORMAT))
+            wf.setframerate(RATE)
+            wf.writeframes(b"".join(frames))
+        metrics = {"wav_save_elapsed_seconds": round(time.time() - started_at, 3)}
+        logging.info("File saved successfully to %s in %.3fs", audio_path, metrics["wav_save_elapsed_seconds"])
+        return metrics
+
+    def save_recording_wav_worker(self, audio_path: str, frames: list[bytes], performance_metrics: dict | None = None) -> None:
+        try:
+            metrics = self.save_recording_wav(audio_path, frames)
+            if isinstance(performance_metrics, dict):
+                performance_metrics.update(metrics)
+        except Exception as e:
+            logging.error("Error saving wave file asynchronously: %s", e, exc_info=True)
 
     def start_hotkey_listener(self) -> bool:
         self.stop_hotkey_listener()
@@ -2518,7 +2940,11 @@ class AudioRecorderApp:
             return
         self.recording = True
         self.current_trigger_source = trigger_source
-        self.current_record_prompt_processing_enabled = self.prompt_processing_enabled and self.prompt_processing_default_for_recordings
+        self.current_record_prompt_processing_enabled = (
+            self.prompt_processing_enabled
+            and self.prompt_processing_default_for_recordings
+            and self.correction_mode != "no_llm"
+        )
         self.target_window_id = None
         if self.dictation_mode_enabled and self.auto_paste_enabled and self.session_type == "x11":
             self.target_window_id = self.paste_manager.get_active_window_id()
@@ -2611,25 +3037,24 @@ class AudioRecorderApp:
             self.set_app_state("error")
             return
         self.is_probably_silent_recording()
-        self.set_app_state("saving")
         wave_output_filename = output_filename()
+        frames_snapshot = list(self.frames)
+        self.set_app_state("saving")
         try:
-            with wave.open(wave_output_filename, "wb") as wf:
-                wf.setnchannels(CHANNELS)
-                wf.setsampwidth(self.p.get_sample_size(FORMAT))
-                wf.setframerate(RATE)
-                wf.writeframes(b"".join(self.frames))
-            logging.info(f"File saved successfully to {wave_output_filename}")
             if not self.auto_transcribe_after_stop:
+                self.save_recording_wav(wave_output_filename, frames_snapshot)
                 self.set_status(f"Nagranie zapisane: {wave_output_filename}")
                 self.set_app_state("idle")
                 return
+            audio_input, preparation_metrics = audio_frames_to_asr_input(frames_snapshot, self.asr_trim_silence_enabled)
+            preparation_metrics["wav_save_async"] = True
+            threading.Thread(target=self.save_recording_wav_worker, args=(wave_output_filename, frames_snapshot, preparation_metrics), daemon=True).start()
             self.transcribing = True
             self.set_app_state("transcribing")
             self.set_transcription_text("Transkrypcja w toku...")
             threading.Thread(
                 target=self.run_transcription,
-                args=(wave_output_filename, self.current_trigger_source, self.target_window_id, self.current_record_prompt_processing_enabled),
+                args=(wave_output_filename, audio_input, preparation_metrics, self.current_trigger_source, self.target_window_id, self.current_record_prompt_processing_enabled),
                 daemon=True,
             ).start()
             logging.info("Transcription thread started.")
@@ -2639,18 +3064,20 @@ class AudioRecorderApp:
             self.set_app_state("error")
             logging.error(f"Error saving wave file: {e}", exc_info=True)
 
-    def run_transcription(self, audio_path, trigger_source="main_button", target_window_id=None, prompt_processing_for_recording=False):
+    def run_transcription(self, audio_path, audio_input, preparation_metrics=None, trigger_source="main_button", target_window_id=None, prompt_processing_for_recording=False):
         logging.info(f"Running transcription for {audio_path} in thread: {threading.get_ident()}")
         try:
             if self.asr_pipeline is None:
                 raise RuntimeError("No ASR model is loaded.")
-            processed_audio_path = preprocess_audio(audio_path)
-            duration_seconds = get_audio_duration_seconds(processed_audio_path)
-            logging.info(f"Starting transcription. model={self.current_model_name}, device={self.device_name}, language={self.language}, num_beams={self.num_beams}, audio={processed_audio_path}")
+            total_started_at = time.time()
+            performance_metrics = preparation_metrics if isinstance(preparation_metrics, dict) else {}
+            duration_seconds = float(performance_metrics.get("duration_seconds") or 0.0)
+            if duration_seconds <= 0:
+                duration_seconds = get_audio_duration_seconds(preprocess_audio(audio_path))
+                performance_metrics["duration_seconds"] = duration_seconds
+            logging.info(f"Starting transcription. model={self.current_model_name}, device={self.device_name}, language={self.language}, num_beams={self.num_beams}, audio=in-memory")
             started_at = time.time()
-            generate_kwargs = {"task": "transcribe", "num_beams": self.num_beams}
-            if self.language != "auto":
-                generate_kwargs["language"] = self.language
+            generate_kwargs = create_asr_generate_kwargs(self.language, self.num_beams)
             call_kwargs = build_asr_call_kwargs(duration_seconds, generate_kwargs)
             logging.info(
                 "ASR call options. duration=%.2fs long_form=%s return_timestamps=%s",
@@ -2658,9 +3085,12 @@ class AudioRecorderApp:
                 duration_seconds > LONG_FORM_TRANSCRIPTION_THRESHOLD_SECONDS,
                 call_kwargs.get("return_timestamps", False),
             )
-            result = self.asr_pipeline(processed_audio_path, **call_kwargs)
+            result = self.asr_pipeline(audio_input, **call_kwargs)
             transcription = postprocess_transcription(result["text"].strip())
             elapsed_seconds = round(time.time() - started_at, 2)
+            performance_metrics["asr_elapsed_seconds"] = elapsed_seconds
+            if duration_seconds > 0:
+                performance_metrics["real_time_factor"] = round(elapsed_seconds / duration_seconds, 3)
             logging.info(f"Transcription finished in {elapsed_seconds}s.")
             processed_text = ""
             prompt_processing_metadata = {
@@ -2671,10 +3101,36 @@ class AudioRecorderApp:
                 "prompt_processing_elapsed_seconds": 0,
                 "prompt_processing_error": "",
             }
-            if prompt_processing_for_recording and transcription.strip():
+            metadata = {
+                "model_name": self.current_model_name,
+                "device": self.device_name,
+                "language": self.language,
+                "duration_seconds": duration_seconds,
+                "auto_paste_enabled": self.auto_paste_enabled,
+                "paste_success": False,
+                "target_window_id": target_window_id,
+                "trigger_source": trigger_source,
+                "hotkey": self.global_hotkey if trigger_source == "global_hotkey" else "",
+                "acceleration_profile": self.acceleration_profile,
+                "asr_backend": self.current_asr_backend or self.asr_backend,
+                "asr_compute_type": self.current_asr_compute_type,
+                "asr_cpu_threads": self.asr_cpu_threads,
+                "asr_quality_profile": self.asr_quality_profile,
+                "correction_mode": self.correction_mode,
+                "asr_warmup_enabled": self.asr_warmup_enabled,
+                "asr_trim_silence_enabled": self.asr_trim_silence_enabled,
+                "asr_vad_enabled": self.asr_vad_enabled,
+                "asr_elapsed_seconds": elapsed_seconds,
+                "stop_to_first_text_seconds": round(time.time() - total_started_at + float(performance_metrics.get("audio_prepare_elapsed_seconds", 0.0)), 2),
+                "total_after_stop_elapsed_seconds": round(time.time() - total_started_at + float(performance_metrics.get("audio_prepare_elapsed_seconds", 0.0)), 2),
+                "performance_metrics": performance_metrics,
+                **prompt_processing_metadata,
+            }
+            if prompt_processing_for_recording and transcription.strip() and self.correction_mode == "full_correction":
                 self.transcription_queue.put({"type": "status", "status": "Porządkowanie promptu..."})
                 prompt_result = self.process_prompt_text(transcription)
                 processed_text = prompt_result.text
+                performance_metrics["llm_elapsed_seconds"] = prompt_result.elapsed_seconds
                 prompt_processing_metadata.update({
                     "processed_text": processed_text,
                     "prompt_processing_backend": prompt_result.backend,
@@ -2682,30 +3138,31 @@ class AudioRecorderApp:
                     "prompt_processing_elapsed_seconds": prompt_result.elapsed_seconds,
                     "prompt_processing_error": prompt_result.error or "",
                 })
+                metadata.update(prompt_processing_metadata)
+                metadata["total_after_stop_elapsed_seconds"] = round(time.time() - total_started_at + float(performance_metrics.get("audio_prepare_elapsed_seconds", 0.0)), 2)
             self.transcription_queue.put({
-                "type": "transcription",
+                "type": "transcription_ready",
                 "text": transcription,
                 "processed_text": processed_text,
                 "audio_path": audio_path,
-                "metadata": {
-                    "model_name": self.current_model_name,
-                    "device": self.device_name,
-                    "language": self.language,
-                    "duration_seconds": duration_seconds,
-                    "auto_paste_enabled": self.auto_paste_enabled,
-                    "paste_success": False,
-                    "target_window_id": target_window_id,
-                    "trigger_source": trigger_source,
-                    "hotkey": self.global_hotkey if trigger_source == "global_hotkey" else "",
-                    **prompt_processing_metadata,
-                },
+                "metadata": metadata,
             })
+            if prompt_processing_for_recording and transcription.strip() and self.correction_mode not in {"full_correction", "no_llm"}:
+                threading.Thread(
+                    target=self.process_prompt_after_transcription_worker,
+                    args=(transcription, audio_path),
+                    daemon=True,
+                ).start()
         except FileNotFoundError:
             logging.error(f"Audio file not found at path: {audio_path}")
-            self.transcription_queue.put({"type": "transcription", "text": f"ERROR: Audio file not found at path: {audio_path}", "audio_path": audio_path, "metadata": {}})
+            self.transcription_queue.put({"type": "transcription_ready", "text": f"ERROR: Audio file not found at path: {audio_path}", "audio_path": audio_path, "metadata": {}})
         except Exception as e:
             logging.error(f"An unexpected error occurred during transcription: {e}", exc_info=True)
-            self.transcription_queue.put({"type": "transcription", "text": f"ERROR: An unexpected error occurred during transcription: {e}", "audio_path": audio_path, "metadata": {}})
+            self.transcription_queue.put({"type": "transcription_ready", "text": f"ERROR: An unexpected error occurred during transcription: {e}", "audio_path": audio_path, "metadata": {}})
+
+    def process_prompt_after_transcription_worker(self, transcription: str, audio_path: str):
+        result = self.process_prompt_text(transcription)
+        self.transcription_queue.put({"type": "prompt_ready", "audio_path": audio_path, "result": result})
 
     def check_transcription_queue(self):
         try:
@@ -2714,6 +3171,8 @@ class AudioRecorderApp:
             if item_type == "model_loaded":
                 self.asr_pipeline = queue_item["pipeline"]
                 self.current_model_name = queue_item["model_name"]
+                self.current_asr_backend = queue_item.get("backend", self.asr_backend)
+                self.current_asr_compute_type = queue_item.get("compute_type", "")
                 self.model_loading = False
                 self.persist_settings()
                 self.set_app_state("idle")
@@ -2735,7 +3194,7 @@ class AudioRecorderApp:
                 self.apply_llm_connection_status(queue_item["status"])
             elif item_type == "manual_prompt_error":
                 self.set_status(f"LLM niedostępny: {queue_item.get('message', 'sprawdź konfigurację')}")
-            elif item_type == "transcription":
+            elif item_type in {"transcription", "transcription_ready"}:
                 self.transcribing = False
                 result = queue_item.get("text", "")
                 processed_text = queue_item.get("processed_text", "")
@@ -2773,6 +3232,34 @@ class AudioRecorderApp:
                     self.app_state = "idle"
                     self.set_recording_widget_state("done")
                     self.recording_widget_hide_id = self.master.after(2000, self.hide_recording_widget)
+            elif item_type == "prompt_ready":
+                prompt_result = queue_item["result"]
+                audio_path = queue_item.get("audio_path", "")
+                self.last_processed_text = prompt_result.text
+                self.last_prompt_processing_error = prompt_result.error
+                if prompt_result.text and self.preview_mode == "processed":
+                    self.set_preview_mode("processed")
+                updated = False
+                for index, entry in enumerate(self.transcription_history):
+                    if entry.get("audio_path") != audio_path:
+                        continue
+                    performance = entry.setdefault("performance_metrics", {})
+                    if isinstance(performance, dict):
+                        performance["llm_elapsed_seconds"] = prompt_result.elapsed_seconds
+                    entry["processed_text"] = prompt_result.text
+                    entry["prompt_processing_enabled_for_recording"] = True
+                    entry["prompt_processing_backend"] = prompt_result.backend
+                    entry["prompt_processing_model"] = prompt_result.model
+                    entry["prompt_processing_elapsed_seconds"] = prompt_result.elapsed_seconds
+                    entry["prompt_processing_error"] = prompt_result.error or ""
+                    self.save_history()
+                    self.refresh_history_list(selected_index=index)
+                    updated = True
+                    break
+                if prompt_result.error:
+                    self.set_status(f"LLM error: {prompt_result.error}")
+                else:
+                    self.set_status("Prompt LLM gotowy w tle" if updated else "Prompt LLM gotowy")
             elif item_type == "prompt_reprocessed_last":
                 prompt_result = queue_item["result"]
                 self.last_processed_text = prompt_result.text
