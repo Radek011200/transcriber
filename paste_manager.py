@@ -77,6 +77,7 @@ class PasteManager:
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=1,
             )
             window_id = result.stdout.strip()
             logging.info("Active X11 window before recording: %s", window_id or "none")
@@ -94,7 +95,7 @@ class PasteManager:
             logging.warning("Cannot restore target window. session=%s window_id=%s xdotool=%s", self.session_type, window_id, bool(self.tools["xdotool"]))
             return False
         try:
-            subprocess.run(["xdotool", "windowactivate", window_id], check=True, capture_output=True, text=True)
+            subprocess.run(["xdotool", "windowactivate", window_id], check=True, capture_output=True, text=True, timeout=1)
             logging.info("Restored target window: %s", window_id)
             return True
         except Exception as e:
@@ -118,10 +119,16 @@ class PasteManager:
                 self.session_type,
             )
             copied = self.clipboard_manager.copy_text(text)
+            copy_method = getattr(self.clipboard_manager, "last_copy_method", "")
             if copied:
-                verified = self.clipboard_manager.verify_text(text)
-                if self.session_type == "x11":
-                    self.clipboard_manager.get_targets()
+                if copy_method in {"xclip", "tkinter"}:
+                    verified = True
+                    time.sleep(0.08 if copy_method == "xclip" else 0.02)
+                    logging.info("Clipboard verification skipped for %s handoff before paste.", copy_method)
+                else:
+                    verified = self.clipboard_manager.verify_text(text)
+                    if self.session_type == "x11":
+                        self.clipboard_manager.get_targets()
 
             if not copied:
                 error = "Could not copy text to clipboard."
@@ -137,23 +144,26 @@ class PasteManager:
                 if restored:
                     time.sleep(0.12)
 
-            method, success, error = self._send_paste_keystroke()
+            method, success, error = self._send_paste_keystroke(copy_method)
+            self._release_stuck_modifiers()
             return self._result(success, method, error, copied, verified, restored, target_window_id)
         except Exception as e:
             logging.error("Auto-paste failed with unexpected exception: %s", e, exc_info=True)
+            self._release_stuck_modifiers()
             return self._result(False, method, str(e), copied, verified, restored, target_window_id)
 
-    def _send_paste_keystroke(self) -> tuple[str, bool, str | None]:
+    def _send_paste_keystroke(self, copy_method: str = "") -> tuple[str, bool, str | None]:
         strategies = self._strategies()
         last_error = None
         for strategy in strategies:
             try:
                 if strategy == "xdotool" and self.tools["xdotool"] and self.session_type == "x11":
-                    subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"], check=True, capture_output=True, text=True)
+                    subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"], check=True, capture_output=True, text=True, timeout=1)
                     if self.press_enter_after_paste:
-                        subprocess.run(["xdotool", "key", "--clearmodifiers", "Return"], check=True, capture_output=True, text=True)
+                        subprocess.run(["xdotool", "key", "--clearmodifiers", "Return"], check=True, capture_output=True, text=True, timeout=1)
                     logging.info("Paste keystroke sent via xdotool.")
-                    return "xclip_text_plain_plus_xdotool_ctrl_v", True, None
+                    prefix = copy_method or "clipboard"
+                    return f"{prefix}_plus_xdotool_ctrl_v", True, None
                 if strategy == "pyautogui" and pyautogui is not None:
                     pyautogui.hotkey("ctrl", "v")
                     if self.press_enter_after_paste:
@@ -175,6 +185,33 @@ class PasteManager:
         if self.session_type == "x11":
             return ["xdotool", "pyautogui"]
         return ["pyautogui"]
+
+    def _release_clipboard_owner(self) -> None:
+        release = getattr(self.clipboard_manager, "release_clipboard_owner", None)
+        if callable(release):
+            release()
+
+    def _release_stuck_modifiers(self) -> None:
+        if self.session_type != "x11" or not self.tools["xdotool"]:
+            return
+        try:
+            subprocess.run(
+                [
+                    "xdotool",
+                    "keyup",
+                    "Control_L",
+                    "Control_R",
+                    "Alt_L",
+                    "Alt_R",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+            logging.info("Released possible stuck X11 modifier keys.")
+        except Exception as e:
+            logging.warning("Could not release X11 modifier keys: %s", e, exc_info=True)
 
     def _result(
         self,

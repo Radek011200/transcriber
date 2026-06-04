@@ -17,6 +17,8 @@ class ClipboardManager:
     def __init__(self, tk_root: tk.Tk | None = None, session_type: str | None = None):
         self.tk_root = tk_root
         self.session_type = (session_type or os.environ.get("XDG_SESSION_TYPE", "unknown")).lower()
+        self._xclip_processes: list[subprocess.Popen] = []
+        self.last_copy_method = ""
         self.tools = {
             "xdotool": shutil.which("xdotool"),
             "xclip": shutil.which("xclip"),
@@ -33,11 +35,15 @@ class ClipboardManager:
     def copy_text(self, text: str) -> bool:
         """Copies text as text/plain where the platform tool supports it."""
         logging.info("Clipboard copy requested. text_length=%s", len(text))
+        self._reap_xclip_processes()
+        self._stop_xclip_processes()
+        self.last_copy_method = ""
         methods = self._copy_methods()
         for method in methods:
             try:
                 if method == "pyperclip" and pyperclip is not None:
                     pyperclip.copy(text)
+                    self.last_copy_method = "pyperclip"
                     logging.info("Clipboard copy succeeded via pyperclip.")
                     return True
                 if method == "wl-copy" and self.tools["wl-copy"]:
@@ -47,23 +53,35 @@ class ClipboardManager:
                         text=True,
                         check=True,
                         capture_output=True,
+                        timeout=2,
                     )
+                    self.last_copy_method = "wl-copy"
                     logging.info("Clipboard copy succeeded via wl-copy text/plain.")
                     return True
                 if method == "xclip" and self.tools["xclip"]:
-                    subprocess.run(
+                    process = subprocess.Popen(
                         ["xclip", "-selection", "clipboard", "-t", "text/plain"],
-                        input=text,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
                         text=True,
-                        check=True,
-                        capture_output=True,
+                        start_new_session=True,
                     )
-                    logging.info("Clipboard copy succeeded via xclip text/plain.")
+                    try:
+                        process.stdin.write(text)
+                        process.stdin.close()
+                    except Exception:
+                        process.kill()
+                        raise
+                    self._xclip_processes.append(process)
+                    self.last_copy_method = "xclip"
+                    logging.info("Clipboard copy handed off to xclip. pid=%s", process.pid)
                     return True
                 if method == "tkinter" and self.tk_root is not None:
                     self.tk_root.clipboard_clear()
                     self.tk_root.clipboard_append(text)
                     self.tk_root.update_idletasks()
+                    self.last_copy_method = "tkinter"
                     logging.info("Clipboard copy succeeded via tkinter.")
                     return True
             except Exception as e:
@@ -98,6 +116,7 @@ class ClipboardManager:
                         check=True,
                         capture_output=True,
                         text=True,
+                        timeout=1,
                     )
                     return result.stdout
                 if method == "xclip" and self.tools["xclip"]:
@@ -106,6 +125,7 @@ class ClipboardManager:
                         check=True,
                         capture_output=True,
                         text=True,
+                        timeout=1,
                     )
                     return result.stdout
                 if method == "tkinter" and self.tk_root is not None:
@@ -124,6 +144,7 @@ class ClipboardManager:
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=1,
             )
             targets = [line.strip() for line in result.stdout.splitlines() if line.strip()]
             logging.info("X11 clipboard TARGETS: %s", targets)
@@ -132,16 +153,45 @@ class ClipboardManager:
             logging.error("Could not read X11 clipboard TARGETS: %s", e, exc_info=True)
             return []
 
+    def _reap_xclip_processes(self) -> None:
+        live_processes = []
+        for process in self._xclip_processes:
+            if process.poll() is None:
+                live_processes.append(process)
+                continue
+            try:
+                process.wait(timeout=0)
+            except Exception:
+                logging.debug("Could not reap finished xclip process.", exc_info=True)
+        self._xclip_processes = live_processes[-3:]
+
+    def release_clipboard_owner(self) -> None:
+        self._stop_xclip_processes()
+
+    def _stop_xclip_processes(self) -> None:
+        for process in self._xclip_processes:
+            if process.poll() is not None:
+                continue
+            try:
+                process.terminate()
+                process.wait(timeout=0.2)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    logging.debug("Could not kill stale xclip process.", exc_info=True)
+        self._xclip_processes = []
+
     def _copy_methods(self) -> list[str]:
         if self.session_type == "wayland":
             return ["wl-copy", "pyperclip", "tkinter"]
         if self.session_type == "x11":
-            return ["xclip", "pyperclip", "tkinter"]
+            return ["xclip", "tkinter", "pyperclip"]
         return ["wl-copy", "xclip", "pyperclip", "tkinter"]
 
     def _read_methods(self) -> list[str]:
         if self.session_type == "wayland":
             return ["pyperclip", "wl-paste", "tkinter"]
         if self.session_type == "x11":
-            return ["pyperclip", "xclip", "tkinter"]
+            return ["tkinter", "pyperclip", "xclip"]
         return ["pyperclip", "wl-paste", "xclip", "tkinter"]

@@ -1461,6 +1461,7 @@ class AudioRecorderApp:
         self.logs_output.grid(row=2, column=0, padx=14, pady=(0, 14), sticky="nsew")
 
     def show_view(self, view_name: str):
+        self.current_view_name = view_name
         for name, frame in self.views.items():
             if name == view_name:
                 frame.grid()
@@ -2550,9 +2551,15 @@ class AudioRecorderApp:
         self.transcription_history = [item for item in history if isinstance(item, dict) and isinstance(item.get("text"), str)] if isinstance(history, list) else []
 
     def save_history(self):
+        started_at = time.perf_counter()
         try:
             with open(history_filename(), "w", encoding="utf-8") as history_file:
                 json.dump(self.transcription_history, history_file, ensure_ascii=False, indent=2)
+            logging.info(
+                "History saved. entries=%s elapsed=%.3fs",
+                len(self.transcription_history),
+                time.perf_counter() - started_at,
+            )
         except OSError as e:
             logging.error(f"Could not save transcription history: {e}", exc_info=True)
             messagebox.showerror("History Error", f"Could not save transcription history: {e}")
@@ -2560,6 +2567,7 @@ class AudioRecorderApp:
     def refresh_history_list(self, selected_index=None):
         if not hasattr(self, "history_list_frame"):
             return
+        started_at = time.perf_counter()
         for child in self.history_list_frame.winfo_children():
             child.destroy()
         self.history_cards = []
@@ -2567,6 +2575,7 @@ class AudioRecorderApp:
             ctk.CTkLabel(self.history_list_frame, text="Brak transkrypcji.", text_color="gray70").pack(padx=12, pady=12, anchor="w")
             self.selected_history_index = None
             self.show_history_placeholder("Brak transkrypcji.")
+            logging.info("History list refreshed. entries=0 elapsed=%.3fs", time.perf_counter() - started_at)
             return
         if selected_index is None:
             selected_index = 0
@@ -2590,6 +2599,12 @@ class AudioRecorderApp:
                 child.bind("<Button-1>", lambda _event, i=index: self.show_history_entry(i))
             self.history_cards.append(card)
         self.show_history_entry(selected_index)
+        logging.info(
+            "History list refreshed. entries=%s selected_index=%s elapsed=%.3fs",
+            len(self.transcription_history),
+            selected_index,
+            time.perf_counter() - started_at,
+        )
 
     def show_history_placeholder(self, text: str):
         if hasattr(self, "history_metadata_label"):
@@ -2685,12 +2700,21 @@ class AudioRecorderApp:
         self.refresh_history_list()
 
     def add_history_entry(self, transcription, audio_path, metadata=None):
+        started_at = time.perf_counter()
         history_entry = {"timestamp": time.time(), "audio_path": audio_path, "text": transcription}
         if metadata:
             history_entry.update(metadata)
         self.transcription_history.insert(0, history_entry)
         self.save_history()
-        self.refresh_history_list(selected_index=0)
+        if getattr(self, "current_view_name", "dashboard") == "history":
+            self.refresh_history_list(selected_index=0)
+        else:
+            logging.info("History list refresh skipped because current view is not history.")
+        logging.info(
+            "History entry added. entries=%s elapsed=%.3fs",
+            len(self.transcription_history),
+            time.perf_counter() - started_at,
+        )
 
     def copy_to_clipboard(self, text: str):
         copied = self.clipboard_manager.copy_text(text)
@@ -3228,9 +3252,9 @@ class AudioRecorderApp:
                     metadata["paste_error"] = paste_result.error
                     metadata["restored_window"] = paste_result.restored_window
                     metadata["paste_result"] = paste_result.to_dict()
-                    self.add_history_entry(result, audio_path, metadata)
                     self.app_state = "idle"
                     self.set_recording_widget_state("done")
+                    self.master.after(50, lambda r=result, p=audio_path, m=dict(metadata): self.add_history_entry(r, p, m))
                     self.recording_widget_hide_id = self.master.after(2000, self.hide_recording_widget)
             elif item_type == "prompt_ready":
                 prompt_result = queue_item["result"]
@@ -3253,7 +3277,10 @@ class AudioRecorderApp:
                     entry["prompt_processing_elapsed_seconds"] = prompt_result.elapsed_seconds
                     entry["prompt_processing_error"] = prompt_result.error or ""
                     self.save_history()
-                    self.refresh_history_list(selected_index=index)
+                    if getattr(self, "current_view_name", "dashboard") == "history":
+                        self.refresh_history_list(selected_index=index)
+                    else:
+                        logging.info("History list refresh skipped after prompt update because current view is not history.")
                     updated = True
                     break
                 if prompt_result.error:
