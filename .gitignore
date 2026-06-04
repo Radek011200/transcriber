@@ -3,6 +3,7 @@
 __pycache__/
 *.log
 output/settings.json
+output/transcription-history.json
 output/*.wav
 .DS_Store
 .agents/
